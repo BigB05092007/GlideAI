@@ -81,5 +81,4 @@ npm install @mediapipe/pose @mediapipe/camera_utils react-webcam lucide-react
 * **Phase 3 (B2B):** White-label licensing of the CMP (Continuous Motion Prediction) engine to triathlon training apps.
 
 ---
-
 **Proprietary & Confidential** *Developed by Brett Caslick | GlideAI Tech Holdings*
