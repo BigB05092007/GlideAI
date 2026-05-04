@@ -55,7 +55,9 @@ interface ShoulderMetrics {
 
 interface TechniqueAnalysis {
   stroke: StrokeType;
+  rawStroke: StrokeType;
   confidence: number;
+  lockState: "acquiring" | "locked" | "switching" | "holding";
   shoulders: ShoulderMetrics;
   feedback: TechniqueFeedback[];
 }
@@ -68,6 +70,50 @@ interface FullAnalysis {
 interface StrokeRange {
   minY: number;
   maxY: number;
+}
+
+interface StrokeMemory {
+  stableStroke: StrokeType;
+  stableConfidence: number;
+  candidateStroke: StrokeType;
+  candidateFrames: number;
+  unknownFrames: number;
+}
+
+interface MotionTrack {
+  points: Point[];
+}
+
+interface ArmMotion {
+  samples: number;
+  rangeX: number;
+  rangeY: number;
+}
+
+interface MotionSummary {
+  left: ArmMotion;
+  right: ArmMotion;
+}
+
+interface MotionHistory {
+  leftWrist: MotionTrack;
+  rightWrist: MotionTrack;
+}
+
+interface ActiveArmMemory {
+  side: ArmSide | null;
+  candidateSide: ArmSide | null;
+  candidateFrames: number;
+  missingFrames: number;
+}
+
+interface ArmSignal {
+  score: number;
+  complete: boolean;
+  partial: boolean;
+  hasShoulder: boolean;
+  hasElbow: boolean;
+  hasWrist: boolean;
 }
 
 type PoseConnection = readonly [number, number];
@@ -87,6 +133,16 @@ const EVF_ANGLE_MAX = 120;
 const EVF_VERTICALITY_MIN = 70;
 const CATCH_PHASE_THRESHOLD = 0.3;
 const STROKE_RANGE_DECAY = 0.005;
+const LANDMARK_SMOOTHING_ALPHA = 0.42;
+const MOTION_HISTORY_LENGTH = 42;
+const STROKE_ACQUIRE_FRAMES = 8;
+const STROKE_SWITCH_FRAMES = 18;
+const STROKE_MEMORY_HOLD_FRAMES = 75;
+const ACTIVE_ARM_ACQUIRE_FRAMES = 4;
+const ACTIVE_ARM_SWITCH_FRAMES = 20;
+const ACTIVE_ARM_HOLD_FRAMES = 90;
+const UI_UPDATE_INTERVAL_MS = 250;
+const MIN_ARM_SIGNAL_SCORE = 0.95;
 const NEON_GREEN = "#39FF14";
 const DEFAULT_LIMB = "rgba(0, 200, 255, 0.55)";
 const DEFAULT_JOINT = "rgba(255, 255, 255, 0.85)";
@@ -129,11 +185,42 @@ function distance(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+function range(values: number[]): number {
+  if (values.length === 0) return 0;
+  return Math.max(...values) - Math.min(...values);
+}
+
 function isVisible(
   lm: NormalizedLandmark | undefined,
   minVisibility = 0.5
 ): lm is NormalizedLandmark {
   return Boolean(lm && (lm.visibility === undefined || lm.visibility >= minVisibility));
+}
+
+function smoothLandmarks(
+  current: NormalizedLandmark[],
+  previous: NormalizedLandmark[] | null
+): NormalizedLandmark[] {
+  if (!previous) {
+    return current.map((lm) => ({ ...lm }));
+  }
+
+  return current.map((lm, index) => {
+    const prev = previous[index];
+    if (!prev) return { ...lm };
+
+    const currentVisibility = landmarkVisibility(lm);
+    const previousVisibility = landmarkVisibility(prev);
+    const alpha = currentVisibility < 0.35 ? 0.18 : LANDMARK_SMOOTHING_ALPHA;
+
+    return {
+      ...lm,
+      x: prev.x * (1 - alpha) + lm.x * alpha,
+      y: prev.y * (1 - alpha) + lm.y * alpha,
+      z: prev.z * (1 - alpha) + lm.z * alpha,
+      visibility: Math.max(currentVisibility, previousVisibility * 0.82),
+    };
+  });
 }
 
 function landmarkVisibility(lm: NormalizedLandmark | undefined): number {
@@ -146,29 +233,239 @@ function armIndices(side: ArmSide) {
     : { shoulder: 12, elbow: 14, wrist: 16 };
 }
 
-function armVisibilityScore(landmarks: NormalizedLandmark[], side: ArmSide) {
+function oppositeArm(side: ArmSide): ArmSide {
+  return side === "left" ? "right" : "left";
+}
+
+function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal {
   const indices = armIndices(side);
   const shoulder = landmarks[indices.shoulder];
   const elbow = landmarks[indices.elbow];
   const wrist = landmarks[indices.wrist];
+  const hasShoulder = isVisible(shoulder, 0.25);
+  const hasElbow = isVisible(elbow, 0.25);
+  const hasWrist = isVisible(wrist, 0.25);
 
-  if (!isVisible(shoulder, 0.25) || !isVisible(elbow, 0.25) || !isVisible(wrist, 0.25)) {
-    return 0;
+  if (!hasElbow || !hasWrist) {
+    return {
+      score: 0,
+      complete: false,
+      partial: false,
+      hasShoulder,
+      hasElbow,
+      hasWrist,
+    };
   }
 
-  return (
-    landmarkVisibility(shoulder) +
+  const forearm = distance(elbow, wrist);
+  const forearmOk = forearm >= 0.025 && forearm <= 0.78;
+  const upperArm = hasShoulder ? distance(shoulder, elbow) : 0;
+  const upperArmOk = !hasShoulder || (upperArm >= 0.025 && upperArm <= 0.78);
+  const ratio = hasShoulder && upperArm > 0 ? forearm / upperArm : 1;
+  const ratioOk = !hasShoulder || (ratio >= 0.28 && ratio <= 3.4);
+
+  if (!forearmOk || !upperArmOk || !ratioOk) {
+    return {
+      score: 0,
+      complete: false,
+      partial: false,
+      hasShoulder,
+      hasElbow,
+      hasWrist,
+    };
+  }
+
+  const rawScore =
     landmarkVisibility(elbow) +
-    landmarkVisibility(wrist)
-  );
+    landmarkVisibility(wrist) +
+    (hasShoulder ? landmarkVisibility(shoulder) + 0.35 : 0);
+
+  return {
+    score: rawScore,
+    complete: hasShoulder,
+    partial: true,
+    hasShoulder,
+    hasElbow,
+    hasWrist,
+  };
+}
+
+function armVisibilityScore(landmarks: NormalizedLandmark[], side: ArmSide) {
+  return getArmSignal(landmarks, side).score;
+}
+
+function armHasCompleteChain(landmarks: NormalizedLandmark[], side: ArmSide) {
+  return getArmSignal(landmarks, side).complete;
 }
 
 function pickPrimaryArm(landmarks: NormalizedLandmark[]): ArmSide | null {
   const leftScore = armVisibilityScore(landmarks, "left");
   const rightScore = armVisibilityScore(landmarks, "right");
 
-  if (leftScore === 0 && rightScore === 0) return null;
+  if (leftScore < MIN_ARM_SIGNAL_SCORE && rightScore < MIN_ARM_SIGNAL_SCORE) return null;
   return leftScore >= rightScore ? "left" : "right";
+}
+
+function createMotionHistory(): MotionHistory {
+  return {
+    leftWrist: { points: [] },
+    rightWrist: { points: [] },
+  };
+}
+
+function summarizeMotion(track: MotionTrack): ArmMotion {
+  const points = track.points;
+  return {
+    samples: points.length,
+    rangeX: range(points.map((point) => point.x)),
+    rangeY: range(points.map((point) => point.y)),
+  };
+}
+
+function pushMotionPoint(track: MotionTrack, landmark: NormalizedLandmark | undefined) {
+  if (!isVisible(landmark, 0.35)) return;
+
+  track.points.push({ x: landmark.x, y: landmark.y });
+  if (track.points.length > MOTION_HISTORY_LENGTH) {
+    track.points.splice(0, track.points.length - MOTION_HISTORY_LENGTH);
+  }
+}
+
+function updateMotionHistory(
+  history: MotionHistory,
+  landmarks: NormalizedLandmark[]
+): MotionSummary {
+  pushMotionPoint(history.leftWrist, landmarks[15]);
+  pushMotionPoint(history.rightWrist, landmarks[16]);
+
+  return {
+    left: summarizeMotion(history.leftWrist),
+    right: summarizeMotion(history.rightWrist),
+  };
+}
+
+function createStrokeMemory(): StrokeMemory {
+  return {
+    stableStroke: "Unknown",
+    stableConfidence: 0,
+    candidateStroke: "Unknown",
+    candidateFrames: 0,
+    unknownFrames: 0,
+  };
+}
+
+function createActiveArmMemory(): ActiveArmMemory {
+  return {
+    side: null,
+    candidateSide: null,
+    candidateFrames: 0,
+    missingFrames: 0,
+  };
+}
+
+function hasSideViewSignal(landmarks: NormalizedLandmark[]): boolean {
+  const leftShoulder = landmarks[11];
+  const rightShoulder = landmarks[12];
+  const leftVisible = isVisible(leftShoulder, 0.35);
+  const rightVisible = isVisible(rightShoulder, 0.35);
+
+  if (leftVisible !== rightVisible) return true;
+  if (!leftVisible || !rightVisible) return false;
+
+  return distance(leftShoulder, rightShoulder) < 0.12;
+}
+
+function shouldUseSingleArmMode(landmarks: NormalizedLandmark[]): boolean {
+  const leftScore = armVisibilityScore(landmarks, "left");
+  const rightScore = armVisibilityScore(landmarks, "right");
+
+  return hasSideViewSignal(landmarks) || Math.abs(leftScore - rightScore) > 0.9;
+}
+
+function resolveActiveArm(
+  landmarks: NormalizedLandmark[],
+  memory: ActiveArmMemory
+): ArmSide | null {
+  const leftScore = armVisibilityScore(landmarks, "left");
+  const rightScore = armVisibilityScore(landmarks, "right");
+  const candidate = pickPrimaryArm(landmarks);
+
+  if (!candidate) {
+    memory.missingFrames += 1;
+    if (memory.side && memory.missingFrames <= ACTIVE_ARM_HOLD_FRAMES) {
+      return memory.side;
+    }
+
+    memory.side = null;
+    memory.candidateSide = null;
+    memory.candidateFrames = 0;
+    return null;
+  }
+
+  memory.missingFrames = 0;
+
+  if (!memory.side) {
+    if (memory.candidateSide === candidate) {
+      memory.candidateFrames += 1;
+    } else {
+      memory.candidateSide = candidate;
+      memory.candidateFrames = 1;
+    }
+
+    if (memory.candidateFrames >= ACTIVE_ARM_ACQUIRE_FRAMES) {
+      memory.side = candidate;
+      memory.candidateSide = null;
+      memory.candidateFrames = 0;
+    }
+
+    return memory.side ?? candidate;
+  }
+
+  if (candidate === memory.side) {
+    memory.candidateSide = null;
+    memory.candidateFrames = 0;
+    return memory.side;
+  }
+
+  const activeScore = memory.side === "left" ? leftScore : rightScore;
+  const candidateScore = candidate === "left" ? leftScore : rightScore;
+  const candidateClearlyBetter = candidateScore > activeScore + 0.75;
+
+  if (!candidateClearlyBetter) {
+    return memory.side;
+  }
+
+  if (memory.candidateSide === candidate) {
+    memory.candidateFrames += 1;
+  } else {
+    memory.candidateSide = candidate;
+    memory.candidateFrames = 1;
+  }
+
+  if (memory.candidateFrames >= ACTIVE_ARM_SWITCH_FRAMES) {
+    memory.side = candidate;
+    memory.candidateSide = null;
+    memory.candidateFrames = 0;
+  }
+
+  return memory.side;
+}
+
+function suppressArm(
+  landmarks: NormalizedLandmark[],
+  side: ArmSide
+): NormalizedLandmark[] {
+  const indices = armIndices(side);
+  const suppressed = landmarks.map((lm) => ({ ...lm }));
+
+  for (const index of [indices.shoulder, indices.elbow, indices.wrist]) {
+    const landmark = suppressed[index];
+    if (landmark) {
+      suppressed[index] = { ...landmark, visibility: 0 };
+    }
+  }
+
+  return suppressed;
 }
 
 function emptyArmEVF(): ArmEVF {
@@ -227,6 +524,24 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
   const primaryArm = pickPrimaryArm(landmarks);
 
   if (!leftVisible && !rightVisible) {
+    if (primaryArm) {
+      const indices = armIndices(primaryArm);
+      const elbow = landmarks[indices.elbow];
+      const wrist = landmarks[indices.wrist];
+
+      if (isVisible(elbow, 0.25) && isVisible(wrist, 0.25)) {
+        return {
+          visible: true,
+          view: "side",
+          trackedSide: primaryArm,
+          slopeDegrees: 0,
+          width: 0.12,
+          centerX: (elbow.x + wrist.x) / 2,
+          centerY: (elbow.y + wrist.y) / 2,
+        };
+      }
+    }
+
     return {
       visible: false,
       view: "unknown",
@@ -272,7 +587,8 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
 
 function classifyStroke(
   landmarks: NormalizedLandmark[],
-  shoulders: ShoulderMetrics
+  shoulders: ShoulderMetrics,
+  motion: MotionSummary
 ): Pick<TechniqueAnalysis, "stroke" | "confidence"> {
   const leftWrist = landmarks[15];
   const rightWrist = landmarks[16];
@@ -291,7 +607,22 @@ function classifyStroke(
     isVisible(rightElbow);
 
   if (shoulders.view === "side" || !bothArmsVisible) {
-    return { stroke: "Freestyle", confidence: 0.62 };
+    const primaryMotion = motion[primaryArm];
+    const completeChain = armHasCompleteChain(landmarks, primaryArm);
+    const hasStrokeMotion =
+      primaryMotion.samples >= 8 &&
+      (primaryMotion.rangeX > 0.055 || primaryMotion.rangeY > 0.055);
+
+    return {
+      stroke: "Freestyle",
+      confidence: hasStrokeMotion
+        ? completeChain
+          ? 0.72
+          : 0.58
+        : completeChain
+          ? 0.54
+          : 0.44,
+    };
   }
 
   const shoulderWidth = Math.max(shoulders.width, 0.08);
@@ -324,28 +655,32 @@ function classifyStroke(
 
 function analyzeTechnique(
   landmarks: NormalizedLandmark[],
-  evf: EVFResult
+  evf: EVFResult,
+  motion: MotionSummary
 ): TechniqueAnalysis {
   const shoulders = getShoulderMetrics(landmarks);
-  const { stroke, confidence } = classifyStroke(landmarks, shoulders);
+  const { stroke, confidence } = classifyStroke(landmarks, shoulders, motion);
   const feedback: TechniqueFeedback[] = [];
   const leftWrist = landmarks[15];
   const rightWrist = landmarks[16];
   const primaryArm = pickPrimaryArm(landmarks);
+  const primarySignal = primaryArm ? getArmSignal(landmarks, primaryArm) : null;
 
   if (!shoulders.visible) {
     feedback.push({
       id: "shoulders-hidden",
       severity: "critical",
-      message: "Move sideways until at least one shoulder, elbow, and wrist are visible.",
+      message: "Show at least one elbow and wrist; shoulder improves EVF accuracy.",
     });
   } else if (shoulders.view === "side") {
     feedback.push({
       id: "side-view",
       severity: primaryArm ? "good" : "warning",
       message: primaryArm
-        ? `Side-view tracking: using the ${primaryArm} shoulder-arm chain.`
-        : "Side-view detected; bring one full arm into frame for catch feedback.",
+        ? primarySignal?.complete
+          ? `Side-view tracking: using the ${primaryArm} shoulder-arm chain.`
+          : `Single-arm tracking: using visible ${primaryArm} elbow and wrist.`
+        : "Side-view detected; bring one arm into frame for catch feedback.",
     });
   } else {
     feedback.push({
@@ -419,7 +754,131 @@ function analyzeTechnique(
     });
   }
 
-  return { stroke, confidence, shoulders, feedback: feedback.slice(0, 5) };
+  return {
+    stroke,
+    rawStroke: stroke,
+    confidence,
+    lockState: "acquiring",
+    shoulders,
+    feedback: feedback.slice(0, 5),
+  };
+}
+
+function withStrokeMemory(
+  analysis: TechniqueAnalysis,
+  memory: StrokeMemory
+): TechniqueAnalysis {
+  const rawStroke = analysis.rawStroke;
+  let stroke = memory.stableStroke;
+  let confidence = memory.stableConfidence;
+  let lockState: TechniqueAnalysis["lockState"] =
+    stroke === "Unknown" ? "acquiring" : "locked";
+
+  if (rawStroke === "Unknown") {
+    memory.unknownFrames += 1;
+
+    if (
+      memory.stableStroke !== "Unknown" &&
+      memory.unknownFrames <= STROKE_MEMORY_HOLD_FRAMES
+    ) {
+      stroke = memory.stableStroke;
+      confidence = Math.max(0.36, memory.stableConfidence * 0.82);
+      lockState = "holding";
+    } else {
+      stroke = "Unknown";
+      confidence = 0;
+      lockState = "acquiring";
+    }
+  } else {
+    memory.unknownFrames = 0;
+
+    if (memory.stableStroke === "Unknown") {
+      if (memory.candidateStroke === rawStroke) {
+        memory.candidateFrames += 1;
+      } else {
+        memory.candidateStroke = rawStroke;
+        memory.candidateFrames = 1;
+      }
+
+      if (
+        memory.candidateFrames >= STROKE_ACQUIRE_FRAMES &&
+        analysis.confidence >= 0.5
+      ) {
+        memory.stableStroke = rawStroke;
+        memory.stableConfidence = analysis.confidence;
+        stroke = rawStroke;
+        confidence = analysis.confidence;
+        lockState = "locked";
+      } else {
+        stroke = "Unknown";
+        confidence = analysis.confidence;
+        lockState = "acquiring";
+      }
+    } else if (rawStroke === memory.stableStroke) {
+      memory.candidateStroke = "Unknown";
+      memory.candidateFrames = 0;
+      memory.stableConfidence =
+        memory.stableConfidence * 0.82 + analysis.confidence * 0.18;
+      stroke = memory.stableStroke;
+      confidence = memory.stableConfidence;
+      lockState = "locked";
+    } else if (analysis.confidence < 0.62) {
+      stroke = memory.stableStroke;
+      confidence = Math.max(0.4, memory.stableConfidence * 0.9);
+      lockState = "locked";
+    } else {
+      if (memory.candidateStroke === rawStroke) {
+        memory.candidateFrames += 1;
+      } else {
+        memory.candidateStroke = rawStroke;
+        memory.candidateFrames = 1;
+      }
+
+      if (memory.candidateFrames >= STROKE_SWITCH_FRAMES) {
+        memory.stableStroke = rawStroke;
+        memory.stableConfidence = analysis.confidence;
+        memory.candidateStroke = "Unknown";
+        memory.candidateFrames = 0;
+        stroke = rawStroke;
+        confidence = analysis.confidence;
+        lockState = "locked";
+      } else {
+        stroke = memory.stableStroke;
+        confidence = Math.max(0.42, memory.stableConfidence * 0.92);
+        lockState = "switching";
+      }
+    }
+  }
+
+  const feedback = [...analysis.feedback];
+  if (lockState === "acquiring") {
+    feedback.unshift({
+      id: "style-acquiring",
+      severity: "warning",
+      message: "Learning the current stroke; keep one full arm path visible.",
+    });
+  } else if (lockState === "switching") {
+    feedback.unshift({
+      id: "style-switching",
+      severity: "warning",
+      message: `Possible switch to ${rawStroke}; holding ${stroke} until it repeats.`,
+    });
+  } else if (lockState === "holding") {
+    feedback.unshift({
+      id: "style-holding",
+      severity: "good",
+      message: `Style memory is holding ${stroke} through brief occlusion.`,
+    });
+  }
+
+  return {
+    ...analysis,
+    stroke,
+    rawStroke,
+    confidence,
+    lockState,
+    feedback: feedback.slice(0, 5),
+  };
 }
 
 function drawSkeleton(
@@ -518,6 +977,13 @@ function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
   const technique = analysis?.technique ?? null;
   const arm = evf ? pickDisplayArm(evf) : null;
   const anyEVF = evf ? evf.left.isEVF || evf.right.isEVF : false;
+  const viewLabel = !technique
+    ? "--"
+    : technique.shoulders.view === "side"
+      ? "Side"
+      : technique.shoulders.visible
+        ? `${technique.shoulders.slopeDegrees.toFixed(1)} deg`
+        : "--";
 
   return (
     <div className="flex flex-col gap-4 w-80 shrink-0">
@@ -537,7 +1003,12 @@ function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
           </p>
         </div>
         <p className="text-xs text-zinc-500 mt-2">
-          Shoulder-led classifier using arms, wrists, and EVF catch timing.
+          {technique
+            ? `${technique.lockState === "locked" ? "Locked" : technique.lockState} style memory`
+            : "Waiting for stable stroke evidence"}
+          {technique && technique.rawStroke !== technique.stroke
+            ? ` / raw: ${technique.rawStroke}`
+            : ""}
         </p>
       </div>
 
@@ -564,11 +1035,7 @@ function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
           </span>
         </div>
         <p className="text-2xl font-mono font-bold tabular-nums text-zinc-200">
-          {technique?.shoulders.view === "side"
-            ? "Side"
-            : technique?.shoulders.visible
-              ? `${technique.shoulders.slopeDegrees.toFixed(1)} deg`
-              : "--"}
+          {viewLabel}
         </p>
         <p className="text-xs text-zinc-500 mt-2">
           Yellow marks the shoulder and arm chain used for analysis.
@@ -711,6 +1178,12 @@ export default function AnalysisEngine() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokeRangeRef = useRef<StrokeRange>({ minY: 1, maxY: 0 });
   const poseConnectionsRef = useRef<readonly PoseConnection[] | null>(null);
+  const smoothedLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
+  const motionHistoryRef = useRef<MotionHistory>(createMotionHistory());
+  const strokeMemoryRef = useRef<StrokeMemory>(createStrokeMemory());
+  const activeArmMemoryRef = useRef<ActiveArmMemory>(createActiveArmMemory());
+  const lastStateUpdateRef = useRef(0);
+  const missingFramesRef = useRef(0);
 
   const [analysisState, setAnalysisState] = useState<FullAnalysis | null>(null);
   const [cameraReady, setCameraReady] = useState(false);
@@ -731,11 +1204,30 @@ export default function AnalysisEngine() {
 
     if (!results.poseLandmarks) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      setAnalysisState(null);
+      missingFramesRef.current += 1;
+      if (missingFramesRef.current > 18) {
+        setAnalysisState(null);
+        smoothedLandmarksRef.current = null;
+      }
       return;
     }
 
-    const lm = results.poseLandmarks;
+    missingFramesRef.current = 0;
+
+    const smoothed = smoothLandmarks(results.poseLandmarks, smoothedLandmarksRef.current);
+    smoothedLandmarksRef.current = smoothed;
+
+    const singleArmMode = shouldUseSingleArmMode(smoothed);
+    if (!singleArmMode) {
+      activeArmMemoryRef.current = createActiveArmMemory();
+    }
+
+    const activeArm = singleArmMode
+      ? resolveActiveArm(smoothed, activeArmMemoryRef.current)
+      : null;
+    const lm = activeArm ? suppressArm(smoothed, oppositeArm(activeArm)) : smoothed;
+
+    const motion = updateMotionHistory(motionHistoryRef.current, lm);
     const sr = strokeRangeRef.current;
     const wrists = [lm[15], lm[16]].filter(
       (w): w is NormalizedLandmark => isVisible(w, 0.35)
@@ -757,8 +1249,16 @@ export default function AnalysisEngine() {
     }
 
     const evf = checkEVF(lm, sr);
-    const analysis = { evf, technique: analyzeTechnique(lm, evf) };
-    setAnalysisState(analysis);
+    const rawTechnique = analyzeTechnique(lm, evf, motion);
+    const technique = withStrokeMemory(rawTechnique, strokeMemoryRef.current);
+    const analysis = { evf, technique };
+    const now = performance.now();
+
+    if (now - lastStateUpdateRef.current > UI_UPDATE_INTERVAL_MS) {
+      setAnalysisState(analysis);
+      lastStateUpdateRef.current = now;
+    }
+
     drawSkeleton(ctx, lm, poseConnections, analysis, canvas.width, canvas.height);
   }, []);
 
@@ -842,6 +1342,12 @@ export default function AnalysisEngine() {
       setCameraReady(false);
       setIsLoaded(false);
       poseConnectionsRef.current = null;
+      smoothedLandmarksRef.current = null;
+      motionHistoryRef.current = createMotionHistory();
+      strokeMemoryRef.current = createStrokeMemory();
+      activeArmMemoryRef.current = createActiveArmMemory();
+      lastStateUpdateRef.current = 0;
+      missingFramesRef.current = 0;
       try {
         camera?.stop();
       } catch {
