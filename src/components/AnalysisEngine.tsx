@@ -6,6 +6,7 @@ import type { NormalizedLandmark, Results } from "@mediapipe/pose";
 import {
   Activity,
   AlertTriangle,
+  Clock,
   ShieldCheck,
   Target,
   Waves,
@@ -69,6 +70,7 @@ interface TechniqueAnalysis {
 interface FullAnalysis {
   evf: EVFResult;
   technique: TechniqueAnalysis;
+  styleCheck: StyleCheckStatus;
 }
 
 interface StrokeRange {
@@ -84,6 +86,24 @@ interface StrokeMemory {
   candidateStroke: StrokeType;
   candidateFrames: number;
   unknownFrames: number;
+}
+
+interface StyleCheckStatus {
+  intervalMs: number;
+  lastCheckedMsAgo: number | null;
+  nextCheckMs: number;
+  sampleCount: number;
+}
+
+interface StyleVote {
+  samples: number;
+  confidenceTotal: number;
+  confidencePeak: number;
+}
+
+interface StyleAccumulator {
+  samples: number;
+  votes: Partial<Record<StrokeType, StyleVote>>;
 }
 
 interface MotionTrack {
@@ -137,6 +157,7 @@ interface LandmarkTrack {
 type PoseConnection = readonly [number, number];
 type LandmarkTrackingMemory = Array<LandmarkTrack | null>;
 type CatchAxis = "x" | "y";
+type StyleResult = Pick<TechniqueAnalysis, "stroke" | "confidence">;
 type PoseConstructorConfig = { locateFile?: (f: string) => string };
 
 interface PoseInstance {
@@ -157,21 +178,28 @@ const EVF_TOP_VIEW_VERTICALITY_MIN = 58;
 const CATCH_PHASE_THRESHOLD = 0.3;
 const CATCH_PHASE_EDGE_THRESHOLD = 0.28;
 const STROKE_RANGE_DECAY = 0.005;
-const LANDMARK_SMOOTHING_ALPHA = 0.42;
-const LANDMARK_RELIABLE_VISIBILITY = 0.42;
-const LANDMARK_PARTIAL_VISIBILITY = 0.18;
-const LANDMARK_DRAW_VISIBILITY = 0.16;
-const OCCLUSION_HOLD_FRAMES = 46;
-const FULL_POSE_HOLD_FRAMES = 42;
+const LANDMARK_SMOOTHING_ALPHA = 0.24;
+const LANDMARK_RELIABLE_VISIBILITY = 0.5;
+const LANDMARK_PARTIAL_VISIBILITY = 0.22;
+const LANDMARK_DRAW_VISIBILITY = 0.13;
+const HAND_PROXY_VISIBILITY = 0.16;
+const LOW_CONFIDENCE_JUMP_LIMIT = 0.09;
+const RELIABLE_JUMP_LIMIT = 0.22;
+const OCCLUSION_HOLD_FRAMES = 34;
+const FULL_POSE_HOLD_FRAMES = 30;
 const MOTION_HISTORY_LENGTH = 42;
-const STROKE_ACQUIRE_FRAMES = 8;
-const STROKE_SWITCH_FRAMES = 18;
-const STROKE_MEMORY_HOLD_FRAMES = 75;
-const ACTIVE_ARM_ACQUIRE_FRAMES = 4;
-const ACTIVE_ARM_SWITCH_FRAMES = 20;
-const ACTIVE_ARM_HOLD_FRAMES = 90;
+const DEFAULT_STYLE_CHECK_INTERVAL_MS = 6000;
+const MIN_STYLE_CHECK_INTERVAL_MS = 2000;
+const MAX_STYLE_CHECK_INTERVAL_MS = 15000;
+const STYLE_CHECK_INTERVAL_STEP_MS = 1000;
+const STROKE_ACQUIRE_CHECKS = 1;
+const STROKE_SWITCH_CHECKS = 4;
+const STROKE_MEMORY_HOLD_CHECKS = 5;
+const ACTIVE_ARM_ACQUIRE_FRAMES = 6;
+const ACTIVE_ARM_SWITCH_FRAMES = 36;
+const ACTIVE_ARM_HOLD_FRAMES = 120;
 const UI_UPDATE_INTERVAL_MS = 250;
-const MIN_ARM_SIGNAL_SCORE = 0.46;
+const MIN_ARM_SIGNAL_SCORE = 0.62;
 const VIDEO_WIDTH = 960;
 const VIDEO_HEIGHT = 540;
 const NEON_GREEN = "#39FF14";
@@ -184,13 +212,21 @@ const SWIM_CONNECTIONS: readonly PoseConnection[] = [
   [11, 12],
   [11, 13],
   [13, 15],
+  [15, 17],
+  [15, 19],
+  [15, 21],
   [12, 14],
   [14, 16],
+  [16, 18],
+  [16, 20],
+  [16, 22],
   [11, 23],
   [12, 24],
   [23, 24],
 ];
-const SWIM_LANDMARKS = new Set([11, 12, 13, 14, 15, 16, 23, 24]);
+const SWIM_LANDMARKS = new Set([
+  11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+]);
 
 function angleBetweenPoints(a: Point, b: Point, c: Point): number {
   const ba: Point = { x: a.x - b.x, y: a.y - b.y };
@@ -235,6 +271,13 @@ function forearmVerticality(elbow: Point3D, wrist: Point3D, useDepth: boolean): 
 }
 
 function distance(a: Point, b: Point): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function landmarkDistance(
+  a: NormalizedLandmark,
+  b: NormalizedLandmark
+): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
@@ -301,6 +344,26 @@ function blendLandmarks(
   };
 }
 
+function limitLandmarkJump(
+  from: NormalizedLandmark,
+  to: NormalizedLandmark,
+  maxJump: number
+): NormalizedLandmark {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const jump = Math.hypot(dx, dy);
+
+  if (jump <= maxJump || jump === 0) return to;
+
+  const scale = maxJump / jump;
+  return {
+    ...to,
+    x: clamp01(from.x + dx * scale),
+    y: clamp01(from.y + dy * scale),
+    z: (from.z ?? 0) + ((to.z ?? 0) - (from.z ?? 0)) * scale,
+  };
+}
+
 function stabilizeLandmarks(
   current: NormalizedLandmark[],
   memory: LandmarkTrackingMemory
@@ -323,6 +386,12 @@ function stabilizeLandmarks(
     const previousVisibility = landmarkVisibility(prev);
     const isReliable = currentVisibility >= LANDMARK_RELIABLE_VISIBILITY;
     const isPartial = currentVisibility >= LANDMARK_PARTIAL_VISIBILITY;
+    const rawJump = landmarkDistance(prev, currentLandmark);
+    const shouldHoldOutlier =
+      isPartial &&
+      !isReliable &&
+      rawJump > LOW_CONFIDENCE_JUMP_LIMIT &&
+      track.missingFrames <= OCCLUSION_HOLD_FRAMES;
 
     if (!isPartial && track.missingFrames >= OCCLUSION_HOLD_FRAMES) {
       memory[index] = {
@@ -335,35 +404,44 @@ function stabilizeLandmarks(
 
     const predicted: NormalizedLandmark = {
       ...prev,
-      x: clamp01(prev.x + track.velocity.x * 0.65),
-      y: clamp01(prev.y + track.velocity.y * 0.65),
-      z: (prev.z ?? 0) + track.velocity.z * 0.65,
+      x: clamp01(prev.x + track.velocity.x * 0.35),
+      y: clamp01(prev.y + track.velocity.y * 0.35),
+      z: (prev.z ?? 0) + track.velocity.z * 0.35,
       visibility: Math.max(
         currentVisibility,
-        previousVisibility * (isPartial ? 0.94 : 0.88)
+        previousVisibility * (isPartial ? 0.9 : 0.72)
       ),
     };
 
+    const filteredCurrent = shouldHoldOutlier
+      ? predicted
+      : limitLandmarkJump(
+          prev,
+          currentLandmark,
+          isReliable ? RELIABLE_JUMP_LIMIT : LOW_CONFIDENCE_JUMP_LIMIT
+        );
     const alpha = isReliable
-      ? LANDMARK_SMOOTHING_ALPHA
+      ? rawJump > RELIABLE_JUMP_LIMIT
+        ? LANDMARK_SMOOTHING_ALPHA * 0.45
+        : LANDMARK_SMOOTHING_ALPHA
       : isPartial
-        ? 0.16
-        : 0.04;
+        ? 0.1
+        : 0.02;
     const base = isReliable ? prev : predicted;
     const visibility = isReliable
       ? Math.max(currentVisibility, previousVisibility * 0.9)
       : landmarkVisibility(predicted);
-    const next = blendLandmarks(base, currentLandmark, alpha, visibility);
+    const next = blendLandmarks(base, filteredCurrent, alpha, visibility);
     const velocity = isPartial
       ? {
-          x: track.velocity.x * 0.45 + (next.x - prev.x) * 0.55,
-          y: track.velocity.y * 0.45 + (next.y - prev.y) * 0.55,
-          z: track.velocity.z * 0.45 + ((next.z ?? 0) - (prev.z ?? 0)) * 0.55,
+          x: track.velocity.x * 0.68 + (next.x - prev.x) * 0.32,
+          y: track.velocity.y * 0.68 + (next.y - prev.y) * 0.32,
+          z: track.velocity.z * 0.68 + ((next.z ?? 0) - (prev.z ?? 0)) * 0.32,
         }
       : {
-          x: track.velocity.x * 0.82,
-          y: track.velocity.y * 0.82,
-          z: track.velocity.z * 0.82,
+          x: track.velocity.x * 0.72,
+          y: track.velocity.y * 0.72,
+          z: track.velocity.z * 0.72,
         };
 
     memory[index] = {
@@ -388,17 +466,17 @@ function predictLandmarksFromMemory(
 
     const next: NormalizedLandmark = {
       ...track.landmark,
-      x: clamp01(track.landmark.x + track.velocity.x * 0.6),
-      y: clamp01(track.landmark.y + track.velocity.y * 0.6),
-      z: (track.landmark.z ?? 0) + track.velocity.z * 0.6,
-      visibility: landmarkVisibility(track.landmark) * 0.9,
+      x: clamp01(track.landmark.x + track.velocity.x * 0.25),
+      y: clamp01(track.landmark.y + track.velocity.y * 0.25),
+      z: (track.landmark.z ?? 0) + track.velocity.z * 0.25,
+      visibility: landmarkVisibility(track.landmark) * 0.74,
     };
 
     track.landmark = next;
     track.velocity = {
-      x: track.velocity.x * 0.84,
-      y: track.velocity.y * 0.84,
-      z: track.velocity.z * 0.84,
+      x: track.velocity.x * 0.68,
+      y: track.velocity.y * 0.68,
+      z: track.velocity.z * 0.68,
     };
     track.missingFrames += 1;
 
@@ -415,8 +493,163 @@ function armIndices(side: ArmSide) {
     : { shoulder: 12, elbow: 14, wrist: 16 };
 }
 
+function handIndices(side: ArmSide): readonly number[] {
+  return side === "left" ? [17, 19, 21] : [18, 20, 22];
+}
+
 function oppositeArm(side: ArmSide): ArmSide {
   return side === "left" ? "right" : "left";
+}
+
+function averageVisibleLandmarks(
+  landmarks: NormalizedLandmark[],
+  indices: readonly number[],
+  minVisibility: number
+): NormalizedLandmark | null {
+  let weightTotal = 0;
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  let peakVisibility = 0;
+
+  for (const index of indices) {
+    const landmark = landmarks[index];
+    const visibility = landmarkVisibility(landmark);
+    if (!landmark || visibility < minVisibility) continue;
+
+    const weight = Math.max(visibility, 0.01);
+    weightTotal += weight;
+    x += landmark.x * weight;
+    y += landmark.y * weight;
+    z += (landmark.z ?? 0) * weight;
+    peakVisibility = Math.max(peakVisibility, visibility);
+  }
+
+  if (weightTotal === 0) return null;
+
+  return {
+    x: clamp01(x / weightTotal),
+    y: clamp01(y / weightTotal),
+    z: z / weightTotal,
+    visibility: peakVisibility,
+  };
+}
+
+function stabilizeHandEndpoint(
+  landmarks: NormalizedLandmark[],
+  side: ArmSide
+) {
+  const indices = armIndices(side);
+  const shoulder = landmarks[indices.shoulder];
+  const elbow = landmarks[indices.elbow];
+  const wrist = landmarks[indices.wrist];
+  const handProxy = averageVisibleLandmarks(
+    landmarks,
+    handIndices(side),
+    HAND_PROXY_VISIBILITY
+  );
+
+  if (!handProxy || !isVisible(elbow, LANDMARK_DRAW_VISIBILITY)) return;
+
+  let target = handProxy;
+  const handDistance = distance(elbow, handProxy);
+  const upperArmLength =
+    isVisible(shoulder, LANDMARK_DRAW_VISIBILITY) && isVisible(elbow, LANDMARK_DRAW_VISIBILITY)
+      ? distance(shoulder, elbow)
+      : 0;
+  const wristVisibility = landmarkVisibility(wrist);
+  const wristDistance =
+    wrist && isVisible(wrist, LANDMARK_DRAW_VISIBILITY) ? distance(elbow, wrist) : 0;
+  const baseLength = upperArmLength > 0 ? upperArmLength : wristDistance;
+  const minForearmLength = Math.max(0.014, baseLength > 0 ? baseLength * 0.28 : 0.014);
+  const maxForearmLength = clamp(
+    baseLength > 0 ? baseLength * 1.95 : 0.42,
+    0.07,
+    0.56
+  );
+
+  if (handDistance < minForearmLength) return;
+
+  if (handDistance > maxForearmLength) {
+    target = limitLandmarkJump(elbow, handProxy, maxForearmLength);
+  }
+
+  const wristToProxy = wrist ? landmarkDistance(wrist, target) : 0;
+  const proxyDisagreesWithReliableWrist =
+    wristVisibility >= LANDMARK_RELIABLE_VISIBILITY &&
+    wristToProxy > Math.max(0.07, Math.max(wristDistance, minForearmLength) * 0.75);
+  const proxyWeight =
+    proxyDisagreesWithReliableWrist
+      ? 0.08
+      : wristVisibility >= LANDMARK_RELIABLE_VISIBILITY
+      ? 0.28
+      : wristVisibility >= LANDMARK_PARTIAL_VISIBILITY
+        ? 0.58
+        : 0.9;
+  const base = wrist ?? handProxy;
+
+  landmarks[indices.wrist] = blendLandmarks(
+    base,
+    target,
+    proxyWeight,
+    Math.max(
+      wristVisibility * 0.9,
+      landmarkVisibility(target),
+      HAND_PROXY_VISIBILITY
+    )
+  );
+}
+
+function enhanceSwimLandmarks(landmarks: NormalizedLandmark[]): NormalizedLandmark[] {
+  const enhanced = landmarks.map((landmark) => cloneLandmark(landmark));
+
+  stabilizeHandEndpoint(enhanced, "left");
+  stabilizeHandEndpoint(enhanced, "right");
+
+  return enhanced;
+}
+
+function syncEnhancedEndpointMemory(
+  memory: LandmarkTrackingMemory,
+  landmarks: NormalizedLandmark[],
+  index: number
+) {
+  const landmark = landmarks[index];
+  if (!landmark || !isVisible(landmark, LANDMARK_DRAW_VISIBILITY)) return;
+
+  const track = memory[index];
+  if (!track) {
+    memory[index] = {
+      landmark: cloneLandmark(landmark),
+      velocity: { x: 0, y: 0, z: 0 },
+      missingFrames: 0,
+    };
+    return;
+  }
+
+  const previous = track.landmark;
+  const next = blendLandmarks(
+    previous,
+    landmark,
+    landmarkVisibility(landmark) >= LANDMARK_RELIABLE_VISIBILITY ? 0.45 : 0.28,
+    Math.max(landmarkVisibility(previous) * 0.82, landmarkVisibility(landmark))
+  );
+
+  track.landmark = next;
+  track.velocity = {
+    x: track.velocity.x * 0.7 + (next.x - previous.x) * 0.3,
+    y: track.velocity.y * 0.7 + (next.y - previous.y) * 0.3,
+    z: track.velocity.z * 0.7 + ((next.z ?? 0) - (previous.z ?? 0)) * 0.3,
+  };
+  track.missingFrames = 0;
+}
+
+function syncEnhancedArmEndpointMemory(
+  memory: LandmarkTrackingMemory,
+  landmarks: NormalizedLandmark[]
+) {
+  syncEnhancedEndpointMemory(memory, landmarks, 15);
+  syncEnhancedEndpointMemory(memory, landmarks, 16);
 }
 
 function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal {
@@ -541,6 +774,76 @@ function createStrokeMemory(): StrokeMemory {
   };
 }
 
+function createStyleAccumulator(): StyleAccumulator {
+  return {
+    samples: 0,
+    votes: {},
+  };
+}
+
+function pushStyleSample(accumulator: StyleAccumulator, result: StyleResult) {
+  accumulator.samples += 1;
+
+  const vote = accumulator.votes[result.stroke] ?? {
+    samples: 0,
+    confidenceTotal: 0,
+    confidencePeak: 0,
+  };
+
+  vote.samples += 1;
+  vote.confidenceTotal += result.confidence;
+  vote.confidencePeak = Math.max(vote.confidencePeak, result.confidence);
+  accumulator.votes[result.stroke] = vote;
+}
+
+function summarizeStyleSamples(
+  accumulator: StyleAccumulator,
+  fallback: StyleResult
+): StyleResult {
+  const entries = Object.entries(accumulator.votes) as Array<
+    [StrokeType, StyleVote]
+  >;
+
+  if (entries.length === 0 || accumulator.samples === 0) {
+    return fallback;
+  }
+
+  const knownEntries = entries.filter(([stroke]) => stroke !== "Unknown");
+  const candidates = knownEntries.length > 0 ? knownEntries : entries;
+  const [stroke, vote] = candidates.reduce((best, current) => {
+    const bestScore =
+      best[1].samples * 0.7 + best[1].confidenceTotal * 0.3;
+    const currentScore =
+      current[1].samples * 0.7 + current[1].confidenceTotal * 0.3;
+    return currentScore > bestScore ? current : best;
+  });
+  const dominance = vote.samples / Math.max(1, accumulator.samples);
+  const averageConfidence = vote.confidenceTotal / Math.max(1, vote.samples);
+
+  return {
+    stroke,
+    confidence: clamp(averageConfidence * 0.8 + dominance * 0.2, 0, 0.92),
+  };
+}
+
+function createStyleCheckStatus(
+  now: number,
+  intervalMs: number,
+  windowStartedAt: number,
+  lastCheckedAt: number,
+  sampleCount: number
+): StyleCheckStatus {
+  const windowAge = windowStartedAt > 0 ? now - windowStartedAt : 0;
+  const lastCheckedMsAgo = lastCheckedAt > 0 ? now - lastCheckedAt : null;
+
+  return {
+    intervalMs,
+    lastCheckedMsAgo,
+    nextCheckMs: Math.max(0, intervalMs - windowAge),
+    sampleCount,
+  };
+}
+
 function createActiveArmMemory(): ActiveArmMemory {
   return {
     side: null,
@@ -614,10 +917,18 @@ function hasSideViewSignal(landmarks: NormalizedLandmark[]): boolean {
 }
 
 function shouldUseSingleArmMode(landmarks: NormalizedLandmark[]): boolean {
+  if (hasTopViewSignal(landmarks)) return false;
+
   const leftScore = armVisibilityScore(landmarks, "left");
   const rightScore = armVisibilityScore(landmarks, "right");
+  const strongerScore = Math.max(leftScore, rightScore);
+  const weakerScore = Math.min(leftScore, rightScore);
+  const oneArmClearlyDominant =
+    strongerScore >= MIN_ARM_SIGNAL_SCORE + 0.45 &&
+    weakerScore < MIN_ARM_SIGNAL_SCORE * 0.55 &&
+    strongerScore - weakerScore > 1.45;
 
-  return hasSideViewSignal(landmarks) || Math.abs(leftScore - rightScore) > 0.9;
+  return hasSideViewSignal(landmarks) || oneArmClearlyDominant;
 }
 
 function resolveActiveArm(
@@ -696,7 +1007,12 @@ function suppressArm(
   const indices = armIndices(side);
   const suppressed = landmarks.map((lm) => ({ ...lm }));
 
-  for (const index of [indices.shoulder, indices.elbow, indices.wrist]) {
+  for (const index of [
+    indices.shoulder,
+    indices.elbow,
+    indices.wrist,
+    ...handIndices(side),
+  ]) {
     const landmark = suppressed[index];
     if (landmark) {
       suppressed[index] = { ...landmark, visibility: 0 };
@@ -1082,13 +1398,12 @@ function classifyStroke(
   return { stroke: "Unknown", confidence: 0.35 };
 }
 
-function analyzeTechnique(
+function buildTechniqueFeedback(
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
-  motion: MotionSummary,
-  shoulders = getShoulderMetrics(landmarks)
-): TechniqueAnalysis {
-  const { stroke, confidence } = classifyStroke(landmarks, shoulders, motion);
+  shoulders: ShoulderMetrics,
+  stroke: StrokeType
+): TechniqueFeedback[] {
   const feedback: TechniqueFeedback[] = [];
   const leftWrist = landmarks[15];
   const rightWrist = landmarks[16];
@@ -1199,13 +1514,95 @@ function analyzeTechnique(
     });
   }
 
+  return feedback.slice(0, 5);
+}
+
+function createTechniqueAnalysisFromStyle(
+  landmarks: NormalizedLandmark[],
+  evf: EVFResult,
+  shoulders: ShoulderMetrics,
+  style: StyleResult
+): TechniqueAnalysis {
   return {
-    stroke,
-    rawStroke: stroke,
-    confidence,
+    stroke: style.stroke,
+    rawStroke: style.stroke,
+    confidence: style.confidence,
     lockState: "acquiring",
     shoulders,
-    feedback: feedback.slice(0, 5),
+    feedback: buildTechniqueFeedback(landmarks, evf, shoulders, style.stroke),
+  };
+}
+
+function withStyleMemoryFeedback(
+  analysis: Pick<TechniqueAnalysis, "lockState" | "rawStroke" | "stroke">,
+  liveFeedback: TechniqueFeedback[]
+): TechniqueFeedback[] {
+  const feedback = [...liveFeedback];
+  const { lockState, rawStroke, stroke } = analysis;
+
+  if (lockState === "acquiring") {
+    feedback.unshift({
+      id: "style-acquiring",
+      severity: "warning",
+      message: "Learning the current stroke; keep an arm path or shoulder-hip line visible.",
+    });
+  } else if (lockState === "switching") {
+    feedback.unshift({
+      id: "style-switching",
+      severity: "warning",
+      message: `Possible switch to ${rawStroke}; holding ${stroke} until it repeats.`,
+    });
+  } else if (lockState === "holding") {
+    feedback.unshift({
+      id: "style-holding",
+      severity: "good",
+      message: `Style memory is holding ${stroke} through brief occlusion.`,
+    });
+  }
+
+  return feedback.slice(0, 5);
+}
+
+function refreshTechniqueFrame(
+  technique: TechniqueAnalysis,
+  landmarks: NormalizedLandmark[],
+  evf: EVFResult,
+  shoulders: ShoulderMetrics
+): TechniqueAnalysis {
+  const refreshed = {
+    ...technique,
+    shoulders,
+  };
+
+  return {
+    ...refreshed,
+    feedback: withStyleMemoryFeedback(
+      refreshed,
+      buildTechniqueFeedback(landmarks, evf, shoulders, technique.rawStroke)
+    ),
+  };
+}
+
+function createPendingTechnique(
+  landmarks: NormalizedLandmark[],
+  evf: EVFResult,
+  shoulders: ShoulderMetrics
+): TechniqueAnalysis {
+  const pending: TechniqueAnalysis = {
+    stroke: "Unknown",
+    rawStroke: "Unknown",
+    confidence: 0,
+    lockState: "acquiring",
+    shoulders,
+    feedback: [],
+  };
+
+  return {
+    ...pending,
+    feedback: withStyleMemoryFeedback(
+      pending,
+      buildTechniqueFeedback(landmarks, evf, shoulders, "Unknown")
+    ),
   };
 }
 
@@ -1224,7 +1621,7 @@ function withStrokeMemory(
 
     if (
       memory.stableStroke !== "Unknown" &&
-      memory.unknownFrames <= STROKE_MEMORY_HOLD_FRAMES
+      memory.unknownFrames <= STROKE_MEMORY_HOLD_CHECKS
     ) {
       stroke = memory.stableStroke;
       confidence = Math.max(0.36, memory.stableConfidence * 0.82);
@@ -1246,7 +1643,7 @@ function withStrokeMemory(
       }
 
       if (
-        memory.candidateFrames >= STROKE_ACQUIRE_FRAMES &&
+        memory.candidateFrames >= STROKE_ACQUIRE_CHECKS &&
         analysis.confidence >= 0.5
       ) {
         memory.stableStroke = rawStroke;
@@ -1279,7 +1676,7 @@ function withStrokeMemory(
         memory.candidateFrames = 1;
       }
 
-      if (memory.candidateFrames >= STROKE_SWITCH_FRAMES) {
+      if (memory.candidateFrames >= STROKE_SWITCH_CHECKS) {
         memory.stableStroke = rawStroke;
         memory.stableConfidence = analysis.confidence;
         memory.candidateStroke = "Unknown";
@@ -1295,41 +1692,22 @@ function withStrokeMemory(
     }
   }
 
-  const feedback = [...analysis.feedback];
-  if (lockState === "acquiring") {
-    feedback.unshift({
-      id: "style-acquiring",
-      severity: "warning",
-      message: "Learning the current stroke; keep an arm path or shoulder-hip line visible.",
-    });
-  } else if (lockState === "switching") {
-    feedback.unshift({
-      id: "style-switching",
-      severity: "warning",
-      message: `Possible switch to ${rawStroke}; holding ${stroke} until it repeats.`,
-    });
-  } else if (lockState === "holding") {
-    feedback.unshift({
-      id: "style-holding",
-      severity: "good",
-      message: `Style memory is holding ${stroke} through brief occlusion.`,
-    });
-  }
-
   return {
     ...analysis,
     stroke,
     rawStroke,
     confidence,
     lockState,
-    feedback: feedback.slice(0, 5),
+    feedback: withStyleMemoryFeedback(
+      { lockState, rawStroke, stroke },
+      analysis.feedback
+    ),
   };
 }
 
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
   landmarks: NormalizedLandmark[],
-  poseConnections: readonly PoseConnection[],
   analysis: FullAnalysis,
   width: number,
   height: number
@@ -1338,15 +1716,7 @@ function drawSkeleton(
 
   const { evf, technique } = analysis;
   const evfSegments = new Set<string>();
-  const poseConnectionKeys = new Set(
-    poseConnections.map(([startIdx, endIdx]) => `${startIdx}-${endIdx}`)
-  );
-  const swimConnections = SWIM_CONNECTIONS.filter(
-    ([startIdx, endIdx]) =>
-      poseConnectionKeys.size === 0 ||
-      poseConnectionKeys.has(`${startIdx}-${endIdx}`) ||
-      poseConnectionKeys.has(`${endIdx}-${startIdx}`)
-  );
+  const swimConnections = SWIM_CONNECTIONS;
 
   if (evf.left.isEVF) {
     evfSegments.add("11-13");
@@ -1432,11 +1802,34 @@ function feedbackColor(severity: TechniqueFeedback["severity"]) {
   return "border-amber-900/70 bg-amber-950/25 text-amber-100";
 }
 
-function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
+function formatSeconds(ms: number): string {
+  const seconds = ms / 1000;
+  return seconds >= 10 || Number.isInteger(seconds)
+    ? `${seconds.toFixed(0)}s`
+    : `${seconds.toFixed(1)}s`;
+}
+
+function MetricsPanel({
+  analysis,
+  styleCheckIntervalMs,
+  onStyleCheckIntervalChange,
+}: {
+  analysis: FullAnalysis | null;
+  styleCheckIntervalMs: number;
+  onStyleCheckIntervalChange: (intervalMs: number) => void;
+}) {
   const evf = analysis?.evf ?? null;
   const technique = analysis?.technique ?? null;
+  const styleCheck = analysis?.styleCheck ?? null;
   const arm = evf ? pickDisplayArm(evf) : null;
   const anyEVF = evf ? evf.left.isEVF || evf.right.isEVF : false;
+  const lastCheckLabel =
+    styleCheck?.lastCheckedMsAgo === null || styleCheck?.lastCheckedMsAgo === undefined
+      ? "Waiting"
+      : `${formatSeconds(styleCheck.lastCheckedMsAgo)} ago`;
+  const nextCheckLabel = styleCheck
+    ? formatSeconds(styleCheck.nextCheckMs)
+    : formatSeconds(styleCheckIntervalMs);
   const viewLabel = !technique
     ? "--"
     : technique.shoulders.view === "top"
@@ -1471,6 +1864,43 @@ function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
           {technique && technique.rawStroke !== technique.stroke
             ? ` / raw: ${technique.rawStroke}`
             : ""}
+        </p>
+      </div>
+
+      <div className="rounded-lg bg-zinc-950/90 border border-zinc-800/80 p-5 shadow-lg shadow-black/40">
+        <div className="flex items-center gap-2 mb-3">
+          <Clock className="w-4 h-4 text-cyan-400" />
+          <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+            Style Cadence
+          </span>
+        </div>
+        <div className="flex items-end justify-between gap-3">
+          <p className="text-2xl font-mono font-bold tabular-nums text-zinc-200">
+            {formatSeconds(styleCheckIntervalMs)}
+          </p>
+          <p className="text-xs text-cyan-300 tabular-nums">
+            Next {nextCheckLabel}
+          </p>
+        </div>
+        <input
+          type="range"
+          min={MIN_STYLE_CHECK_INTERVAL_MS}
+          max={MAX_STYLE_CHECK_INTERVAL_MS}
+          step={STYLE_CHECK_INTERVAL_STEP_MS}
+          value={styleCheckIntervalMs}
+          onChange={(event) =>
+            onStyleCheckIntervalChange(Number(event.currentTarget.value))
+          }
+          className="mt-4 w-full accent-cyan-400"
+          aria-label="Style check interval"
+        />
+        <div className="mt-3 flex items-center justify-between text-[11px] text-zinc-500">
+          <span>{formatSeconds(MIN_STYLE_CHECK_INTERVAL_MS)}</span>
+          <span>{styleCheck?.sampleCount ?? 0} samples</span>
+          <span>{formatSeconds(MAX_STYLE_CHECK_INTERVAL_MS)}</span>
+        </div>
+        <p className="mt-2 text-xs text-zinc-500">
+          Last check: {lastCheckLabel}
         </p>
       </div>
 
@@ -1643,15 +2073,36 @@ export default function AnalysisEngine() {
   const landmarkMemoryRef = useRef<LandmarkTrackingMemory>(createLandmarkTrackingMemory());
   const motionHistoryRef = useRef<MotionHistory>(createMotionHistory());
   const strokeMemoryRef = useRef<StrokeMemory>(createStrokeMemory());
+  const styleAccumulatorRef = useRef<StyleAccumulator>(createStyleAccumulator());
+  const styleWindowStartedAtRef = useRef(0);
+  const lastStyleCheckRef = useRef(0);
+  const lastStyleTechniqueRef = useRef<TechniqueAnalysis | null>(null);
+  const styleCheckIntervalRef = useRef(DEFAULT_STYLE_CHECK_INTERVAL_MS);
   const activeArmMemoryRef = useRef<ActiveArmMemory>(createActiveArmMemory());
   const lastAnalysisRef = useRef<FullAnalysis | null>(null);
   const lastStateUpdateRef = useRef(0);
   const missingFramesRef = useRef(0);
 
   const [analysisState, setAnalysisState] = useState<FullAnalysis | null>(null);
+  const [styleCheckIntervalMs, setStyleCheckIntervalMs] = useState(
+    DEFAULT_STYLE_CHECK_INTERVAL_MS
+  );
   const [cameraReady, setCameraReady] = useState(false);
   const [videoStreamReady, setVideoStreamReady] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
+
+  const handleStyleCheckIntervalChange = useCallback((intervalMs: number) => {
+    const normalizedInterval = clamp(
+      intervalMs,
+      MIN_STYLE_CHECK_INTERVAL_MS,
+      MAX_STYLE_CHECK_INTERVAL_MS
+    );
+    styleCheckIntervalRef.current = normalizedInterval;
+    styleAccumulatorRef.current = createStyleAccumulator();
+    styleWindowStartedAtRef.current =
+      typeof performance !== "undefined" ? performance.now() : 0;
+    setStyleCheckIntervalMs(normalizedInterval);
+  }, []);
 
   const onResults = useCallback((results: Results) => {
     const canvas = canvasRef.current;
@@ -1660,14 +2111,16 @@ export default function AnalysisEngine() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const poseConnections = poseConnectionsRef.current ?? [];
     const video = webcamRef.current?.video;
     canvas.width = video?.videoWidth || 640;
     canvas.height = video?.videoHeight || 480;
 
     if (!results.poseLandmarks) {
       missingFramesRef.current += 1;
-      const predicted = predictLandmarksFromMemory(landmarkMemoryRef.current);
+      const predictedLandmarks = predictLandmarksFromMemory(landmarkMemoryRef.current);
+      const predicted = predictedLandmarks
+        ? enhanceSwimLandmarks(predictedLandmarks)
+        : null;
 
       if (
         predicted &&
@@ -1677,7 +2130,6 @@ export default function AnalysisEngine() {
         drawSkeleton(
           ctx,
           predicted,
-          poseConnections,
           lastAnalysisRef.current,
           canvas.width,
           canvas.height
@@ -1690,13 +2142,21 @@ export default function AnalysisEngine() {
         setAnalysisState(null);
         lastAnalysisRef.current = null;
         landmarkMemoryRef.current = createLandmarkTrackingMemory();
+        strokeMemoryRef.current = createStrokeMemory();
+        styleAccumulatorRef.current = createStyleAccumulator();
+        styleWindowStartedAtRef.current = 0;
+        lastStyleCheckRef.current = 0;
+        lastStyleTechniqueRef.current = null;
       }
       return;
     }
 
     missingFramesRef.current = 0;
 
-    const smoothed = stabilizeLandmarks(results.poseLandmarks, landmarkMemoryRef.current);
+    const smoothed = enhanceSwimLandmarks(
+      stabilizeLandmarks(results.poseLandmarks, landmarkMemoryRef.current)
+    );
+    syncEnhancedArmEndpointMemory(landmarkMemoryRef.current, smoothed);
 
     const singleArmMode = shouldUseSingleArmMode(smoothed);
     if (!singleArmMode) {
@@ -1714,18 +2174,63 @@ export default function AnalysisEngine() {
     updateStrokeRange(sr, lm);
 
     const evf = checkEVF(lm, sr, shoulders, motion);
-    const rawTechnique = analyzeTechnique(lm, evf, motion, shoulders);
-    const technique = withStrokeMemory(rawTechnique, strokeMemoryRef.current);
-    const analysis = { evf, technique };
-    lastAnalysisRef.current = analysis;
     const now = performance.now();
+    const styleIntervalMs = styleCheckIntervalRef.current;
+
+    if (styleWindowStartedAtRef.current === 0) {
+      styleWindowStartedAtRef.current = now;
+    }
+
+    const rawStyle = classifyStroke(lm, shoulders, motion);
+    pushStyleSample(styleAccumulatorRef.current, rawStyle);
+
+    const shouldCheckStyle =
+      now - styleWindowStartedAtRef.current >= styleIntervalMs;
+    let technique: TechniqueAnalysis;
+
+    if (shouldCheckStyle) {
+      const intervalStyle = summarizeStyleSamples(
+        styleAccumulatorRef.current,
+        rawStyle
+      );
+      const rawTechnique = createTechniqueAnalysisFromStyle(
+        lm,
+        evf,
+        shoulders,
+        intervalStyle
+      );
+      technique = withStrokeMemory(rawTechnique, strokeMemoryRef.current);
+      lastStyleTechniqueRef.current = technique;
+      lastStyleCheckRef.current = now;
+      styleAccumulatorRef.current = createStyleAccumulator();
+      styleWindowStartedAtRef.current = now;
+    } else if (lastStyleTechniqueRef.current) {
+      technique = refreshTechniqueFrame(
+        lastStyleTechniqueRef.current,
+        lm,
+        evf,
+        shoulders
+      );
+    } else {
+      technique = createPendingTechnique(lm, evf, shoulders);
+    }
+
+    const styleCheck = createStyleCheckStatus(
+      now,
+      styleIntervalMs,
+      styleWindowStartedAtRef.current,
+      lastStyleCheckRef.current,
+      styleAccumulatorRef.current.samples
+    );
+    const analysis = { evf, technique, styleCheck };
+    lastAnalysisRef.current = analysis;
 
     if (now - lastStateUpdateRef.current > UI_UPDATE_INTERVAL_MS) {
       setAnalysisState(analysis);
       lastStateUpdateRef.current = now;
     }
 
-    drawSkeleton(ctx, lm, poseConnections, analysis, canvas.width, canvas.height);
+    drawSkeleton(ctx, lm, analysis, canvas.width, canvas.height);
   }, []);
 
   useEffect(() => {
@@ -1758,12 +2263,11 @@ export default function AnalysisEngine() {
         });
 
         poseInstance.setOptions({
-          modelComplexity: 2,
+          modelComplexity: 1,
           smoothLandmarks: true,
-          enableSegmentation: true,
-          smoothSegmentation: true,
-          minDetectionConfidence: 0.35,
-          minTrackingConfidence: 0.3,
+          enableSegmentation: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.55,
         });
 
         poseInstance.onResults(onResults);
@@ -1812,6 +2316,10 @@ export default function AnalysisEngine() {
       landmarkMemoryRef.current = createLandmarkTrackingMemory();
       motionHistoryRef.current = createMotionHistory();
       strokeMemoryRef.current = createStrokeMemory();
+      styleAccumulatorRef.current = createStyleAccumulator();
+      styleWindowStartedAtRef.current = 0;
+      lastStyleCheckRef.current = 0;
+      lastStyleTechniqueRef.current = null;
       activeArmMemoryRef.current = createActiveArmMemory();
       strokeRangeRef.current = { minX: 1, maxX: 0, minY: 1, maxY: 0 };
       lastAnalysisRef.current = null;
@@ -1863,7 +2371,11 @@ export default function AnalysisEngine() {
         )}
       </div>
 
-      <MetricsPanel analysis={analysisState} />
+      <MetricsPanel
+        analysis={analysisState}
+        styleCheckIntervalMs={styleCheckIntervalMs}
+        onStyleCheckIntervalChange={handleStyleCheckIntervalChange}
+      />
     </div>
   );
 }
