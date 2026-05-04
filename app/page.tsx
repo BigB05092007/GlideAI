@@ -31,7 +31,7 @@ export default function Home() {
       </header>
 
       {/* Main Analysis Area */}
-      <section className="flex-1 p-6">
+      <section className="flex-1 min-h-0 p-4 lg:p-6">
         <AnalysisEngine />
       </section>
 
