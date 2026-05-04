@@ -1,5 +1,5 @@
 'use client';
-
+// DONE BY VLAD AND A BIT OF CODEX
 import { useCallback, useEffect, useRef, useState } from "react";
 import Webcam from "react-webcam";
 import type { NormalizedLandmark, Results } from "@mediapipe/pose";
