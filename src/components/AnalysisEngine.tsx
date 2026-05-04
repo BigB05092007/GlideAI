@@ -16,6 +16,10 @@ interface Point {
   y: number;
 }
 
+interface Point3D extends Point {
+  z: number;
+}
+
 interface ArmEVF {
   elbowAngle: number;
   verticality: number;
@@ -45,7 +49,7 @@ interface TechniqueFeedback {
 
 interface ShoulderMetrics {
   visible: boolean;
-  view: "front" | "side" | "unknown";
+  view: "front" | "side" | "top" | "unknown";
   trackedSide: ArmSide | "both" | "none";
   slopeDegrees: number;
   width: number;
@@ -68,6 +72,8 @@ interface FullAnalysis {
 }
 
 interface StrokeRange {
+  minX: number;
+  maxX: number;
   minY: number;
   maxY: number;
 }
@@ -116,7 +122,21 @@ interface ArmSignal {
   hasWrist: boolean;
 }
 
+interface LandmarkVelocity {
+  x: number;
+  y: number;
+  z: number;
+}
+
+interface LandmarkTrack {
+  landmark: NormalizedLandmark;
+  velocity: LandmarkVelocity;
+  missingFrames: number;
+}
+
 type PoseConnection = readonly [number, number];
+type LandmarkTrackingMemory = Array<LandmarkTrack | null>;
+type CatchAxis = "x" | "y";
 type PoseConstructorConfig = { locateFile?: (f: string) => string };
 
 interface PoseInstance {
@@ -130,10 +150,19 @@ interface PoseInstance {
 const DEG = 180 / Math.PI;
 const EVF_ANGLE_MIN = 100;
 const EVF_ANGLE_MAX = 120;
+const EVF_TOP_VIEW_ANGLE_MIN = 90;
+const EVF_TOP_VIEW_ANGLE_MAX = 140;
 const EVF_VERTICALITY_MIN = 70;
+const EVF_TOP_VIEW_VERTICALITY_MIN = 58;
 const CATCH_PHASE_THRESHOLD = 0.3;
+const CATCH_PHASE_EDGE_THRESHOLD = 0.28;
 const STROKE_RANGE_DECAY = 0.005;
 const LANDMARK_SMOOTHING_ALPHA = 0.42;
+const LANDMARK_RELIABLE_VISIBILITY = 0.42;
+const LANDMARK_PARTIAL_VISIBILITY = 0.18;
+const LANDMARK_DRAW_VISIBILITY = 0.16;
+const OCCLUSION_HOLD_FRAMES = 46;
+const FULL_POSE_HOLD_FRAMES = 42;
 const MOTION_HISTORY_LENGTH = 42;
 const STROKE_ACQUIRE_FRAMES = 8;
 const STROKE_SWITCH_FRAMES = 18;
@@ -142,7 +171,9 @@ const ACTIVE_ARM_ACQUIRE_FRAMES = 4;
 const ACTIVE_ARM_SWITCH_FRAMES = 20;
 const ACTIVE_ARM_HOLD_FRAMES = 90;
 const UI_UPDATE_INTERVAL_MS = 250;
-const MIN_ARM_SIGNAL_SCORE = 0.95;
+const MIN_ARM_SIGNAL_SCORE = 0.46;
+const VIDEO_WIDTH = 960;
+const VIDEO_HEIGHT = 540;
 const NEON_GREEN = "#39FF14";
 const DEFAULT_LIMB = "rgba(0, 200, 255, 0.55)";
 const DEFAULT_JOINT = "rgba(255, 255, 255, 0.85)";
@@ -174,15 +205,45 @@ function angleBetweenPoints(a: Point, b: Point, c: Point): number {
   return Math.acos(cosAngle) * DEG;
 }
 
-function forearmVerticality(elbow: Point, wrist: Point): number {
+function angleBetweenPoints3D(a: Point3D, b: Point3D, c: Point3D): number {
+  const ba: Point3D = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+  const bc: Point3D = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+  const dot = ba.x * bc.x + ba.y * bc.y + ba.z * bc.z;
+  const magBA = Math.hypot(ba.x, ba.y, ba.z);
+  const magBC = Math.hypot(bc.x, bc.y, bc.z);
+
+  if (magBA === 0 || magBC === 0) return 0;
+
+  const cosAngle = Math.max(-1, Math.min(1, dot / (magBA * magBC)));
+  return Math.acos(cosAngle) * DEG;
+}
+
+function forearmImageVerticality(elbow: Point, wrist: Point): number {
   const dx = wrist.x - elbow.x;
   const dy = wrist.y - elbow.y;
   const angle = Math.abs(Math.atan2(dy, dx) * DEG);
   return angle > 90 ? 180 - angle : angle;
 }
 
+function forearmVerticality(elbow: Point3D, wrist: Point3D, useDepth: boolean): number {
+  const imageVerticality = forearmImageVerticality(elbow, wrist);
+  if (!useDepth) return imageVerticality;
+
+  const planarLength = Math.hypot(wrist.x - elbow.x, wrist.y - elbow.y);
+  const depthPitch = Math.atan2(Math.abs(wrist.z - elbow.z), Math.max(planarLength, 0.001)) * DEG;
+  return Math.max(imageVerticality, depthPitch);
+}
+
 function distance(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function clamp01(value: number): number {
+  return clamp(value, 0, 1);
 }
 
 function range(values: number[]): number {
@@ -192,39 +253,160 @@ function range(values: number[]): number {
 
 function isVisible(
   lm: NormalizedLandmark | undefined,
-  minVisibility = 0.5
+  minVisibility = LANDMARK_RELIABLE_VISIBILITY
 ): lm is NormalizedLandmark {
   return Boolean(lm && (lm.visibility === undefined || lm.visibility >= minVisibility));
 }
 
-function smoothLandmarks(
+function landmarkVisibility(lm: NormalizedLandmark | undefined): number {
+  return lm?.visibility ?? (lm ? 1 : 0);
+}
+
+function toPoint3D(lm: NormalizedLandmark): Point3D {
+  return {
+    x: lm.x,
+    y: lm.y,
+    z: lm.z ?? 0,
+  };
+}
+
+function cloneLandmark(lm: NormalizedLandmark): NormalizedLandmark {
+  return {
+    ...lm,
+    z: lm.z ?? 0,
+    visibility: landmarkVisibility(lm),
+  };
+}
+
+function createLandmarkTrackingMemory(): LandmarkTrackingMemory {
+  return [];
+}
+
+function emptyLandmark(): NormalizedLandmark {
+  return { x: 0, y: 0, z: 0, visibility: 0 };
+}
+
+function blendLandmarks(
+  from: NormalizedLandmark,
+  to: NormalizedLandmark,
+  alpha: number,
+  visibility: number
+): NormalizedLandmark {
+  return {
+    ...to,
+    x: clamp01(from.x * (1 - alpha) + to.x * alpha),
+    y: clamp01(from.y * (1 - alpha) + to.y * alpha),
+    z: (from.z ?? 0) * (1 - alpha) + (to.z ?? 0) * alpha,
+    visibility,
+  };
+}
+
+function stabilizeLandmarks(
   current: NormalizedLandmark[],
-  previous: NormalizedLandmark[] | null
+  memory: LandmarkTrackingMemory
 ): NormalizedLandmark[] {
-  if (!previous) {
-    return current.map((lm) => ({ ...lm }));
-  }
-
   return current.map((lm, index) => {
-    const prev = previous[index];
-    if (!prev) return { ...lm };
+    const currentLandmark = cloneLandmark(lm);
+    const track = memory[index];
+    const currentVisibility = landmarkVisibility(currentLandmark);
 
-    const currentVisibility = landmarkVisibility(lm);
+    if (!track) {
+      memory[index] = {
+        landmark: currentLandmark,
+        velocity: { x: 0, y: 0, z: 0 },
+        missingFrames: currentVisibility >= LANDMARK_PARTIAL_VISIBILITY ? 0 : 1,
+      };
+      return currentLandmark;
+    }
+
+    const prev = track.landmark;
     const previousVisibility = landmarkVisibility(prev);
-    const alpha = currentVisibility < 0.35 ? 0.18 : LANDMARK_SMOOTHING_ALPHA;
+    const isReliable = currentVisibility >= LANDMARK_RELIABLE_VISIBILITY;
+    const isPartial = currentVisibility >= LANDMARK_PARTIAL_VISIBILITY;
 
-    return {
-      ...lm,
-      x: prev.x * (1 - alpha) + lm.x * alpha,
-      y: prev.y * (1 - alpha) + lm.y * alpha,
-      z: prev.z * (1 - alpha) + lm.z * alpha,
-      visibility: Math.max(currentVisibility, previousVisibility * 0.82),
+    if (!isPartial && track.missingFrames >= OCCLUSION_HOLD_FRAMES) {
+      memory[index] = {
+        landmark: currentLandmark,
+        velocity: { x: 0, y: 0, z: 0 },
+        missingFrames: track.missingFrames + 1,
+      };
+      return currentLandmark;
+    }
+
+    const predicted: NormalizedLandmark = {
+      ...prev,
+      x: clamp01(prev.x + track.velocity.x * 0.65),
+      y: clamp01(prev.y + track.velocity.y * 0.65),
+      z: (prev.z ?? 0) + track.velocity.z * 0.65,
+      visibility: Math.max(
+        currentVisibility,
+        previousVisibility * (isPartial ? 0.94 : 0.88)
+      ),
     };
+
+    const alpha = isReliable
+      ? LANDMARK_SMOOTHING_ALPHA
+      : isPartial
+        ? 0.16
+        : 0.04;
+    const base = isReliable ? prev : predicted;
+    const visibility = isReliable
+      ? Math.max(currentVisibility, previousVisibility * 0.9)
+      : landmarkVisibility(predicted);
+    const next = blendLandmarks(base, currentLandmark, alpha, visibility);
+    const velocity = isPartial
+      ? {
+          x: track.velocity.x * 0.45 + (next.x - prev.x) * 0.55,
+          y: track.velocity.y * 0.45 + (next.y - prev.y) * 0.55,
+          z: track.velocity.z * 0.45 + ((next.z ?? 0) - (prev.z ?? 0)) * 0.55,
+        }
+      : {
+          x: track.velocity.x * 0.82,
+          y: track.velocity.y * 0.82,
+          z: track.velocity.z * 0.82,
+        };
+
+    memory[index] = {
+      landmark: next,
+      velocity,
+      missingFrames: isPartial ? 0 : track.missingFrames + 1,
+    };
+
+    return next;
   });
 }
 
-function landmarkVisibility(lm: NormalizedLandmark | undefined): number {
-  return lm?.visibility ?? (lm ? 1 : 0);
+function predictLandmarksFromMemory(
+  memory: LandmarkTrackingMemory
+): NormalizedLandmark[] | null {
+  if (memory.length === 0) return null;
+
+  let visibleCount = 0;
+  const landmarks = Array.from({ length: Math.max(33, memory.length) }, (_, index) => {
+    const track = memory[index];
+    if (!track) return emptyLandmark();
+
+    const next: NormalizedLandmark = {
+      ...track.landmark,
+      x: clamp01(track.landmark.x + track.velocity.x * 0.6),
+      y: clamp01(track.landmark.y + track.velocity.y * 0.6),
+      z: (track.landmark.z ?? 0) + track.velocity.z * 0.6,
+      visibility: landmarkVisibility(track.landmark) * 0.9,
+    };
+
+    track.landmark = next;
+    track.velocity = {
+      x: track.velocity.x * 0.84,
+      y: track.velocity.y * 0.84,
+      z: track.velocity.z * 0.84,
+    };
+    track.missingFrames += 1;
+
+    if (isVisible(next, LANDMARK_DRAW_VISIBILITY)) visibleCount += 1;
+    return next;
+  });
+
+  return visibleCount >= 2 ? landmarks : null;
 }
 
 function armIndices(side: ArmSide) {
@@ -242,11 +424,12 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
   const shoulder = landmarks[indices.shoulder];
   const elbow = landmarks[indices.elbow];
   const wrist = landmarks[indices.wrist];
-  const hasShoulder = isVisible(shoulder, 0.25);
-  const hasElbow = isVisible(elbow, 0.25);
-  const hasWrist = isVisible(wrist, 0.25);
+  const hasShoulder = isVisible(shoulder, LANDMARK_PARTIAL_VISIBILITY);
+  const hasElbow = isVisible(elbow, LANDMARK_PARTIAL_VISIBILITY);
+  const hasWrist = isVisible(wrist, LANDMARK_PARTIAL_VISIBILITY);
+  const visibleCount = [hasShoulder, hasElbow, hasWrist].filter(Boolean).length;
 
-  if (!hasElbow || !hasWrist) {
+  if (visibleCount < 2) {
     return {
       score: 0,
       complete: false,
@@ -257,12 +440,14 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
     };
   }
 
-  const forearm = distance(elbow, wrist);
-  const forearmOk = forearm >= 0.025 && forearm <= 0.78;
-  const upperArm = hasShoulder ? distance(shoulder, elbow) : 0;
-  const upperArmOk = !hasShoulder || (upperArm >= 0.025 && upperArm <= 0.78);
-  const ratio = hasShoulder && upperArm > 0 ? forearm / upperArm : 1;
-  const ratioOk = !hasShoulder || (ratio >= 0.28 && ratio <= 3.4);
+  const hasForearm = hasElbow && hasWrist;
+  const hasUpperArm = hasShoulder && hasElbow;
+  const forearm = hasForearm ? distance(elbow, wrist) : 0;
+  const upperArm = hasUpperArm ? distance(shoulder, elbow) : 0;
+  const forearmOk = !hasForearm || (forearm >= 0.012 && forearm <= 0.86);
+  const upperArmOk = !hasUpperArm || (upperArm >= 0.012 && upperArm <= 0.86);
+  const ratio = hasForearm && hasUpperArm && upperArm > 0 ? forearm / upperArm : 1;
+  const ratioOk = !(hasForearm && hasUpperArm) || (ratio >= 0.18 && ratio <= 4.7);
 
   if (!forearmOk || !upperArmOk || !ratioOk) {
     return {
@@ -276,13 +461,15 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
   }
 
   const rawScore =
-    landmarkVisibility(elbow) +
-    landmarkVisibility(wrist) +
-    (hasShoulder ? landmarkVisibility(shoulder) + 0.35 : 0);
+    (hasShoulder ? landmarkVisibility(shoulder) : 0) +
+    (hasElbow ? landmarkVisibility(elbow) : 0) +
+    (hasWrist ? landmarkVisibility(wrist) : 0) +
+    (hasForearm ? 0.18 : 0) +
+    (hasShoulder && hasWrist ? 0.12 : 0);
 
   return {
     score: rawScore,
-    complete: hasShoulder,
+    complete: hasShoulder && hasElbow && hasWrist,
     partial: true,
     hasShoulder,
     hasElbow,
@@ -323,7 +510,7 @@ function summarizeMotion(track: MotionTrack): ArmMotion {
 }
 
 function pushMotionPoint(track: MotionTrack, landmark: NormalizedLandmark | undefined) {
-  if (!isVisible(landmark, 0.35)) return;
+  if (!isVisible(landmark, LANDMARK_PARTIAL_VISIBILITY)) return;
 
   track.points.push({ x: landmark.x, y: landmark.y });
   if (track.points.length > MOTION_HISTORY_LENGTH) {
@@ -363,16 +550,67 @@ function createActiveArmMemory(): ActiveArmMemory {
   };
 }
 
+function visiblePoint(
+  lm: NormalizedLandmark | undefined,
+  minVisibility = LANDMARK_PARTIAL_VISIBILITY
+): Point | null {
+  return isVisible(lm, minVisibility) ? { x: lm.x, y: lm.y } : null;
+}
+
+function midpoint(a: Point, b: Point): Point {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  };
+}
+
+function averagePoints(points: Point[]): Point | null {
+  if (points.length === 0) return null;
+
+  return {
+    x: points.reduce((total, point) => total + point.x, 0) / points.length,
+    y: points.reduce((total, point) => total + point.y, 0) / points.length,
+  };
+}
+
+function presentPoints(points: Array<Point | null>): Point[] {
+  return points.filter((point): point is Point => point !== null);
+}
+
+function hasTopViewSignal(landmarks: NormalizedLandmark[]): boolean {
+  const leftShoulder = visiblePoint(landmarks[11], LANDMARK_PARTIAL_VISIBILITY);
+  const rightShoulder = visiblePoint(landmarks[12], LANDMARK_PARTIAL_VISIBILITY);
+  const leftHip = visiblePoint(landmarks[23], LANDMARK_PARTIAL_VISIBILITY);
+  const rightHip = visiblePoint(landmarks[24], LANDMARK_PARTIAL_VISIBILITY);
+
+  if (!leftShoulder || !rightShoulder || (!leftHip && !rightHip)) {
+    return false;
+  }
+
+  const shoulderCenter = midpoint(leftShoulder, rightShoulder);
+  const hipCenter = averagePoints(presentPoints([leftHip, rightHip]));
+  if (!hipCenter) return false;
+
+  const shoulderWidth = distance(leftShoulder, rightShoulder);
+  const hipWidth = leftHip && rightHip ? distance(leftHip, rightHip) : shoulderWidth * 0.8;
+  const torsoLength = distance(shoulderCenter, hipCenter);
+  const bodyWidth = Math.max(shoulderWidth, hipWidth, 0.045);
+
+  return torsoLength > 0.055 && torsoLength > bodyWidth * 0.55;
+}
+
 function hasSideViewSignal(landmarks: NormalizedLandmark[]): boolean {
+  if (hasTopViewSignal(landmarks)) return false;
+
   const leftShoulder = landmarks[11];
   const rightShoulder = landmarks[12];
-  const leftVisible = isVisible(leftShoulder, 0.35);
-  const rightVisible = isVisible(rightShoulder, 0.35);
+  const leftVisible = isVisible(leftShoulder, LANDMARK_PARTIAL_VISIBILITY);
+  const rightVisible = isVisible(rightShoulder, LANDMARK_PARTIAL_VISIBILITY);
 
   if (leftVisible !== rightVisible) return true;
   if (!leftVisible || !rightVisible) return false;
 
-  return distance(leftShoulder, rightShoulder) < 0.12;
+  return distance(leftShoulder, rightShoulder) < 0.075;
 }
 
 function shouldUseSingleArmMode(landmarks: NormalizedLandmark[]): boolean {
@@ -477,26 +715,122 @@ function emptyArmEVF(): ArmEVF {
   };
 }
 
+function getStrokeAnchors(landmarks: NormalizedLandmark[]): NormalizedLandmark[] {
+  const wrists = [landmarks[15], landmarks[16]].filter(
+    (landmark): landmark is NormalizedLandmark =>
+      isVisible(landmark, LANDMARK_PARTIAL_VISIBILITY)
+  );
+
+  if (wrists.length > 0) return wrists;
+
+  return [landmarks[13], landmarks[14]].filter(
+    (landmark): landmark is NormalizedLandmark =>
+      isVisible(landmark, LANDMARK_PARTIAL_VISIBILITY)
+  );
+}
+
+function resetStrokeRange(strokeRange: StrokeRange, anchors: NormalizedLandmark[]) {
+  const xs = anchors.map((anchor) => anchor.x);
+  const ys = anchors.map((anchor) => anchor.y);
+  strokeRange.minX = Math.min(...xs);
+  strokeRange.maxX = Math.max(...xs);
+  strokeRange.minY = Math.min(...ys);
+  strokeRange.maxY = Math.max(...ys);
+}
+
+function updateStrokeRange(
+  strokeRange: StrokeRange,
+  landmarks: NormalizedLandmark[]
+) {
+  const anchors = getStrokeAnchors(landmarks);
+
+  if (anchors.length > 0) {
+    const xs = anchors.map((anchor) => anchor.x);
+    const ys = anchors.map((anchor) => anchor.y);
+    strokeRange.minX = Math.min(strokeRange.minX, Math.min(...xs));
+    strokeRange.maxX = Math.max(strokeRange.maxX, Math.max(...xs));
+    strokeRange.minY = Math.min(strokeRange.minY, Math.min(...ys));
+    strokeRange.maxY = Math.max(strokeRange.maxY, Math.max(...ys));
+  }
+
+  strokeRange.minX += STROKE_RANGE_DECAY;
+  strokeRange.maxX -= STROKE_RANGE_DECAY;
+  strokeRange.minY += STROKE_RANGE_DECAY;
+  strokeRange.maxY -= STROKE_RANGE_DECAY;
+
+  if (
+    anchors.length > 0 &&
+    (strokeRange.minX > strokeRange.maxX || strokeRange.minY > strokeRange.maxY)
+  ) {
+    resetStrokeRange(strokeRange, anchors);
+  }
+}
+
+function selectCatchAxis(
+  strokeRange: StrokeRange,
+  motion: MotionSummary,
+  side: ArmSide,
+  view: ShoulderMetrics["view"]
+): CatchAxis {
+  if (view !== "top") return "y";
+
+  const xRange = Math.max(strokeRange.maxX - strokeRange.minX, motion[side].rangeX);
+  const yRange = Math.max(strokeRange.maxY - strokeRange.minY, motion[side].rangeY);
+  return xRange > yRange * 1.15 ? "x" : "y";
+}
+
+function isInCatchWindow(
+  wrist: NormalizedLandmark,
+  strokeRange: StrokeRange,
+  axis: CatchAxis,
+  allowEitherEdge: boolean
+): boolean {
+  const min = axis === "x" ? strokeRange.minX : strokeRange.minY;
+  const max = axis === "x" ? strokeRange.maxX : strokeRange.maxY;
+  const value = axis === "x" ? wrist.x : wrist.y;
+  const rangeSize = max - min;
+
+  if (rangeSize <= 0.01) return false;
+
+  const progress = (value - min) / rangeSize;
+  return allowEitherEdge
+    ? progress < CATCH_PHASE_EDGE_THRESHOLD ||
+        progress > 1 - CATCH_PHASE_EDGE_THRESHOLD
+    : progress < CATCH_PHASE_THRESHOLD;
+}
+
 function checkEVFForArm(
   shoulder: NormalizedLandmark | undefined,
   elbow: NormalizedLandmark | undefined,
   wrist: NormalizedLandmark | undefined,
-  strokeRange: StrokeRange
+  strokeRange: StrokeRange,
+  axis: CatchAxis,
+  view: ShoulderMetrics["view"]
 ): ArmEVF {
-  if (!isVisible(shoulder, 0.35) || !isVisible(elbow, 0.35) || !isVisible(wrist, 0.35)) {
+  if (
+    !isVisible(shoulder, LANDMARK_PARTIAL_VISIBILITY) ||
+    !isVisible(elbow, LANDMARK_PARTIAL_VISIBILITY) ||
+    !isVisible(wrist, LANDMARK_PARTIAL_VISIBILITY)
+  ) {
     return emptyArmEVF();
   }
 
   const S: Point = { x: shoulder.x, y: shoulder.y };
   const E: Point = { x: elbow.x, y: elbow.y };
   const W: Point = { x: wrist.x, y: wrist.y };
-  const elbowAngle = angleBetweenPoints(S, E, W);
-  const verticality = forearmVerticality(E, W);
-  const range = strokeRange.maxY - strokeRange.minY;
-  const normalizedY = range > 0.01 ? (W.y - strokeRange.minY) / range : 0.5;
-  const inCatchPhase = normalizedY < CATCH_PHASE_THRESHOLD;
-  const angleOk = elbowAngle >= EVF_ANGLE_MIN && elbowAngle <= EVF_ANGLE_MAX;
-  const verticalOk = verticality >= EVF_VERTICALITY_MIN;
+  const useTopGeometry = view === "top";
+  const elbowAngle = useTopGeometry
+    ? angleBetweenPoints3D(toPoint3D(shoulder), toPoint3D(elbow), toPoint3D(wrist))
+    : angleBetweenPoints(S, E, W);
+  const verticality = forearmVerticality(toPoint3D(elbow), toPoint3D(wrist), useTopGeometry);
+  const inCatchPhase = isInCatchWindow(wrist, strokeRange, axis, useTopGeometry);
+  const angleMin = useTopGeometry ? EVF_TOP_VIEW_ANGLE_MIN : EVF_ANGLE_MIN;
+  const angleMax = useTopGeometry ? EVF_TOP_VIEW_ANGLE_MAX : EVF_ANGLE_MAX;
+  const verticalityMin = useTopGeometry
+    ? EVF_TOP_VIEW_VERTICALITY_MIN
+    : EVF_VERTICALITY_MIN;
+  const angleOk = elbowAngle >= angleMin && elbowAngle <= angleMax;
+  const verticalOk = verticality >= verticalityMin;
 
   return {
     elbowAngle,
@@ -508,28 +842,63 @@ function checkEVFForArm(
 
 function checkEVF(
   landmarks: NormalizedLandmark[],
-  strokeRange: StrokeRange
+  strokeRange: StrokeRange,
+  shoulders: ShoulderMetrics,
+  motion: MotionSummary
 ): EVFResult {
   return {
-    left: checkEVFForArm(landmarks[11], landmarks[13], landmarks[15], strokeRange),
-    right: checkEVFForArm(landmarks[12], landmarks[14], landmarks[16], strokeRange),
+    left: checkEVFForArm(
+      landmarks[11],
+      landmarks[13],
+      landmarks[15],
+      strokeRange,
+      selectCatchAxis(strokeRange, motion, "left", shoulders.view),
+      shoulders.view
+    ),
+    right: checkEVFForArm(
+      landmarks[12],
+      landmarks[14],
+      landmarks[16],
+      strokeRange,
+      selectCatchAxis(strokeRange, motion, "right", shoulders.view),
+      shoulders.view
+    ),
   };
 }
 
 function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
   const leftShoulder = landmarks[11];
   const rightShoulder = landmarks[12];
-  const leftVisible = isVisible(leftShoulder, 0.35);
-  const rightVisible = isVisible(rightShoulder, 0.35);
+  const leftVisible = isVisible(leftShoulder, LANDMARK_PARTIAL_VISIBILITY);
+  const rightVisible = isVisible(rightShoulder, LANDMARK_PARTIAL_VISIBILITY);
+  const leftHip = visiblePoint(landmarks[23], LANDMARK_PARTIAL_VISIBILITY);
+  const rightHip = visiblePoint(landmarks[24], LANDMARK_PARTIAL_VISIBILITY);
+  const hipCenter = averagePoints(presentPoints([leftHip, rightHip]));
+  const hipWidth = leftHip && rightHip ? distance(leftHip, rightHip) : 0;
   const primaryArm = pickPrimaryArm(landmarks);
 
   if (!leftVisible && !rightVisible) {
+    if (hipCenter) {
+      return {
+        visible: true,
+        view: "top",
+        trackedSide: primaryArm ?? "none",
+        slopeDegrees: 0,
+        width: Math.max(hipWidth, 0.1),
+        centerX: hipCenter.x,
+        centerY: hipCenter.y,
+      };
+    }
+
     if (primaryArm) {
       const indices = armIndices(primaryArm);
       const elbow = landmarks[indices.elbow];
       const wrist = landmarks[indices.wrist];
 
-      if (isVisible(elbow, 0.25) && isVisible(wrist, 0.25)) {
+      if (
+        isVisible(elbow, LANDMARK_PARTIAL_VISIBILITY) &&
+        isVisible(wrist, LANDMARK_PARTIAL_VISIBILITY)
+      ) {
         return {
           visible: true,
           view: "side",
@@ -557,22 +926,35 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
     const trackedSide: ArmSide =
       primaryArm ?? (leftVisible ? "left" : "right");
     const shoulder = leftVisible ? leftShoulder : rightShoulder;
+    const hasOverheadBodyLine = Boolean(
+      hipCenter && distance({ x: shoulder.x, y: shoulder.y }, hipCenter) > 0.055
+    );
 
     return {
       visible: true,
-      view: "side",
+      view: hasOverheadBodyLine ? "top" : "side",
       trackedSide,
       slopeDegrees: 0,
-      width: 0.12,
-      centerX: shoulder.x,
-      centerY: shoulder.y,
+      width: Math.max(hipWidth, 0.12),
+      centerX:
+        hasOverheadBodyLine && hipCenter
+          ? (shoulder.x + hipCenter.x) / 2
+          : shoulder.x,
+      centerY:
+        hasOverheadBodyLine && hipCenter
+          ? (shoulder.y + hipCenter.y) / 2
+          : shoulder.y,
     };
   }
 
   const left: Point = { x: leftShoulder.x, y: leftShoulder.y };
   const right: Point = { x: rightShoulder.x, y: rightShoulder.y };
   const width = distance(left, right);
-  const view = width < 0.08 ? "side" : "front";
+  const view = hasTopViewSignal(landmarks)
+    ? "top"
+    : width < 0.075
+      ? "side"
+      : "front";
 
   return {
     visible: true,
@@ -596,15 +978,62 @@ function classifyStroke(
   const rightElbow = landmarks[14];
   const primaryArm = pickPrimaryArm(landmarks);
 
-  if (!shoulders.visible || !primaryArm) {
+  if (!shoulders.visible) {
     return { stroke: "Unknown", confidence: 0 };
   }
 
+  if (!primaryArm) {
+    return {
+      stroke: "Unknown",
+      confidence: shoulders.view === "top" ? 0.28 : 0,
+    };
+  }
+
   const bothArmsVisible =
-    isVisible(leftWrist) &&
-    isVisible(rightWrist) &&
-    isVisible(leftElbow) &&
-    isVisible(rightElbow);
+    isVisible(leftWrist, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(rightWrist, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(leftElbow, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(rightElbow, LANDMARK_PARTIAL_VISIBILITY);
+
+  if (shoulders.view === "top") {
+    const leftSignal = getArmSignal(landmarks, "left");
+    const rightSignal = getArmSignal(landmarks, "right");
+    const visibleArmCount = [leftSignal.partial, rightSignal.partial].filter(Boolean).length;
+    const hasStrokeMotion =
+      motion.left.samples + motion.right.samples >= 8 &&
+      motion.left.rangeX + motion.left.rangeY + motion.right.rangeX + motion.right.rangeY >
+        0.075;
+
+    if (bothArmsVisible) {
+      const shoulderWidth = Math.max(shoulders.width, 0.08);
+      const xDominant =
+        motion.left.rangeX + motion.right.rangeX >
+        (motion.left.rangeY + motion.right.rangeY) * 1.15;
+      const wristDelta = xDominant
+        ? Math.abs(leftWrist.x - rightWrist.x)
+        : Math.abs(leftWrist.y - rightWrist.y);
+      const elbowDelta = xDominant
+        ? Math.abs(leftElbow.x - rightElbow.x)
+        : Math.abs(leftElbow.y - rightElbow.y);
+      const armsSynchronized =
+        wristDelta < shoulderWidth * 0.85 && elbowDelta < shoulderWidth * 0.85;
+
+      if (armsSynchronized && hasStrokeMotion) {
+        return { stroke: "Butterfly", confidence: 0.68 };
+      }
+    }
+
+    return {
+      stroke: "Freestyle",
+      confidence: hasStrokeMotion
+        ? visibleArmCount >= 2
+          ? 0.7
+          : 0.6
+        : visibleArmCount >= 2
+          ? 0.56
+          : 0.46,
+    };
+  }
 
   if (shoulders.view === "side" || !bothArmsVisible) {
     const primaryMotion = motion[primaryArm];
@@ -656,9 +1085,9 @@ function classifyStroke(
 function analyzeTechnique(
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
-  motion: MotionSummary
+  motion: MotionSummary,
+  shoulders = getShoulderMetrics(landmarks)
 ): TechniqueAnalysis {
-  const shoulders = getShoulderMetrics(landmarks);
   const { stroke, confidence } = classifyStroke(landmarks, shoulders, motion);
   const feedback: TechniqueFeedback[] = [];
   const leftWrist = landmarks[15];
@@ -670,7 +1099,15 @@ function analyzeTechnique(
     feedback.push({
       id: "shoulders-hidden",
       severity: "critical",
-      message: "Show at least one elbow and wrist; shoulder improves EVF accuracy.",
+      message: "Show at least two upper-body landmarks; occlusion memory will hold brief submersion.",
+    });
+  } else if (shoulders.view === "top") {
+    feedback.push({
+      id: "top-view",
+      severity: "good",
+      message: primarySignal?.complete
+        ? "Top-view tracking: overhead shoulder, hip, and arm geometry locked."
+        : "Top-view partial tracking: holding visible body landmarks through water occlusion.",
     });
   } else if (shoulders.view === "side") {
     feedback.push({
@@ -694,7 +1131,15 @@ function analyzeTechnique(
     feedback.push({
       id: "unknown-stroke",
       severity: "warning",
-      message: "Technique is uncertain; show one full side-view arm path from shoulder to wrist.",
+      message: "Technique is uncertain; keep one arm path or the shoulder-hip line visible.",
+    });
+  }
+
+  if (primarySignal?.partial && !primarySignal.complete) {
+    feedback.push({
+      id: "partial-submerged",
+      severity: "good",
+      message: "Partial swimmer detected; submerged landmarks are being stabilized from recent motion.",
     });
   }
 
@@ -855,7 +1300,7 @@ function withStrokeMemory(
     feedback.unshift({
       id: "style-acquiring",
       severity: "warning",
-      message: "Learning the current stroke; keep one full arm path visible.",
+      message: "Learning the current stroke; keep an arm path or shoulder-hip line visible.",
     });
   } else if (lockState === "switching") {
     feedback.unshift({
@@ -915,12 +1360,23 @@ function drawSkeleton(
   for (const [startIdx, endIdx] of swimConnections) {
     const start = landmarks[startIdx];
     const end = landmarks[endIdx];
-    if (!isVisible(start) || !isVisible(end)) continue;
+    if (
+      !isVisible(start, LANDMARK_DRAW_VISIBILITY) ||
+      !isVisible(end, LANDMARK_DRAW_VISIBILITY)
+    ) {
+      continue;
+    }
 
     const segKey = `${startIdx}-${endIdx}`;
     const isEVFSeg = evfSegments.has(segKey);
     const isShoulderSeg = segKey === "11-12" || segKey === "12-11";
+    const segmentAlpha = clamp(
+      Math.min(landmarkVisibility(start), landmarkVisibility(end)) + 0.2,
+      0.35,
+      1
+    );
 
+    ctx.globalAlpha = segmentAlpha;
     ctx.beginPath();
     ctx.moveTo(start.x * width, start.y * height);
     ctx.lineTo(end.x * width, end.y * height);
@@ -931,18 +1387,20 @@ function drawSkeleton(
     ctx.stroke();
   }
 
+  ctx.globalAlpha = 1;
   ctx.shadowColor = "transparent";
   ctx.shadowBlur = 0;
 
   for (const i of SWIM_LANDMARKS) {
     const lm = landmarks[i];
-    if (!isVisible(lm)) continue;
+    if (!isVisible(lm, LANDMARK_DRAW_VISIBILITY)) continue;
 
     const isEVFJoint =
       (evf.left.isEVF && (i === 11 || i === 13 || i === 15)) ||
       (evf.right.isEVF && (i === 12 || i === 14 || i === 16));
     const isShoulderJoint = technique.shoulders.visible && (i === 11 || i === 12);
 
+    ctx.globalAlpha = clamp(landmarkVisibility(lm) + 0.2, 0.45, 1);
     ctx.beginPath();
     ctx.arc(
       lm.x * width,
@@ -954,6 +1412,8 @@ function drawSkeleton(
     ctx.fillStyle = isEVFJoint ? NEON_GREEN : isShoulderJoint ? SHOULDER_LINE : DEFAULT_JOINT;
     ctx.fill();
   }
+
+  ctx.globalAlpha = 1;
 }
 
 function pickDisplayArm(evf: EVFResult): ArmEVF {
@@ -979,11 +1439,13 @@ function MetricsPanel({ analysis }: { analysis: FullAnalysis | null }) {
   const anyEVF = evf ? evf.left.isEVF || evf.right.isEVF : false;
   const viewLabel = !technique
     ? "--"
-    : technique.shoulders.view === "side"
-      ? "Side"
-      : technique.shoulders.visible
-        ? `${technique.shoulders.slopeDegrees.toFixed(1)} deg`
-        : "--";
+    : technique.shoulders.view === "top"
+      ? "Top"
+      : technique.shoulders.view === "side"
+        ? "Side"
+        : technique.shoulders.visible
+          ? `${technique.shoulders.slopeDegrees.toFixed(1)} deg`
+          : "--";
 
   return (
     <div className="flex flex-col gap-4 w-80 shrink-0">
@@ -1176,12 +1638,13 @@ function resolveCameraCtor(mp: any): new (
 export default function AnalysisEngine() {
   const webcamRef = useRef<Webcam>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const strokeRangeRef = useRef<StrokeRange>({ minY: 1, maxY: 0 });
+  const strokeRangeRef = useRef<StrokeRange>({ minX: 1, maxX: 0, minY: 1, maxY: 0 });
   const poseConnectionsRef = useRef<readonly PoseConnection[] | null>(null);
-  const smoothedLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
+  const landmarkMemoryRef = useRef<LandmarkTrackingMemory>(createLandmarkTrackingMemory());
   const motionHistoryRef = useRef<MotionHistory>(createMotionHistory());
   const strokeMemoryRef = useRef<StrokeMemory>(createStrokeMemory());
   const activeArmMemoryRef = useRef<ActiveArmMemory>(createActiveArmMemory());
+  const lastAnalysisRef = useRef<FullAnalysis | null>(null);
   const lastStateUpdateRef = useRef(0);
   const missingFramesRef = useRef(0);
 
@@ -1203,19 +1666,37 @@ export default function AnalysisEngine() {
     canvas.height = video?.videoHeight || 480;
 
     if (!results.poseLandmarks) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
       missingFramesRef.current += 1;
-      if (missingFramesRef.current > 18) {
+      const predicted = predictLandmarksFromMemory(landmarkMemoryRef.current);
+
+      if (
+        predicted &&
+        lastAnalysisRef.current &&
+        missingFramesRef.current <= FULL_POSE_HOLD_FRAMES
+      ) {
+        drawSkeleton(
+          ctx,
+          predicted,
+          poseConnections,
+          lastAnalysisRef.current,
+          canvas.width,
+          canvas.height
+        );
+        return;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (missingFramesRef.current > FULL_POSE_HOLD_FRAMES) {
         setAnalysisState(null);
-        smoothedLandmarksRef.current = null;
+        lastAnalysisRef.current = null;
+        landmarkMemoryRef.current = createLandmarkTrackingMemory();
       }
       return;
     }
 
     missingFramesRef.current = 0;
 
-    const smoothed = smoothLandmarks(results.poseLandmarks, smoothedLandmarksRef.current);
-    smoothedLandmarksRef.current = smoothed;
+    const smoothed = stabilizeLandmarks(results.poseLandmarks, landmarkMemoryRef.current);
 
     const singleArmMode = shouldUseSingleArmMode(smoothed);
     if (!singleArmMode) {
@@ -1228,30 +1709,15 @@ export default function AnalysisEngine() {
     const lm = activeArm ? suppressArm(smoothed, oppositeArm(activeArm)) : smoothed;
 
     const motion = updateMotionHistory(motionHistoryRef.current, lm);
+    const shoulders = getShoulderMetrics(lm);
     const sr = strokeRangeRef.current;
-    const wrists = [lm[15], lm[16]].filter(
-      (w): w is NormalizedLandmark => isVisible(w, 0.35)
-    );
+    updateStrokeRange(sr, lm);
 
-    if (wrists.length > 0) {
-      const wristY = Math.min(...wrists.map((w) => w.y));
-      sr.minY = Math.min(sr.minY, wristY);
-      sr.maxY = Math.max(sr.maxY, wristY);
-    }
-
-    sr.minY += STROKE_RANGE_DECAY;
-    sr.maxY -= STROKE_RANGE_DECAY;
-
-    if (sr.minY > sr.maxY && wrists.length > 0) {
-      const wristY = Math.min(...wrists.map((w) => w.y));
-      sr.minY = wristY;
-      sr.maxY = wristY;
-    }
-
-    const evf = checkEVF(lm, sr);
-    const rawTechnique = analyzeTechnique(lm, evf, motion);
+    const evf = checkEVF(lm, sr, shoulders, motion);
+    const rawTechnique = analyzeTechnique(lm, evf, motion, shoulders);
     const technique = withStrokeMemory(rawTechnique, strokeMemoryRef.current);
     const analysis = { evf, technique };
+    lastAnalysisRef.current = analysis;
     const now = performance.now();
 
     if (now - lastStateUpdateRef.current > UI_UPDATE_INTERVAL_MS) {
@@ -1292,11 +1758,12 @@ export default function AnalysisEngine() {
         });
 
         poseInstance.setOptions({
-          modelComplexity: 1,
+          modelComplexity: 2,
           smoothLandmarks: true,
-          enableSegmentation: false,
-          minDetectionConfidence: 0.5,
-          minTrackingConfidence: 0.5,
+          enableSegmentation: true,
+          smoothSegmentation: true,
+          minDetectionConfidence: 0.35,
+          minTrackingConfidence: 0.3,
         });
 
         poseInstance.onResults(onResults);
@@ -1320,8 +1787,8 @@ export default function AnalysisEngine() {
               }
             }
           },
-          width: 640,
-          height: 480,
+          width: VIDEO_WIDTH,
+          height: VIDEO_HEIGHT,
         });
 
         camera = cameraInstance;
@@ -1342,10 +1809,12 @@ export default function AnalysisEngine() {
       setCameraReady(false);
       setIsLoaded(false);
       poseConnectionsRef.current = null;
-      smoothedLandmarksRef.current = null;
+      landmarkMemoryRef.current = createLandmarkTrackingMemory();
       motionHistoryRef.current = createMotionHistory();
       strokeMemoryRef.current = createStrokeMemory();
       activeArmMemoryRef.current = createActiveArmMemory();
+      strokeRangeRef.current = { minX: 1, maxX: 0, minY: 1, maxY: 0 };
+      lastAnalysisRef.current = null;
       lastStateUpdateRef.current = 0;
       missingFramesRef.current = 0;
       try {
@@ -1370,7 +1839,11 @@ export default function AnalysisEngine() {
           ref={webcamRef}
           mirrored
           className="relative z-0 w-full h-full object-cover"
-          videoConstraints={{ width: 640, height: 480, facingMode: "user" }}
+          videoConstraints={{
+            width: { ideal: VIDEO_WIDTH },
+            height: { ideal: VIDEO_HEIGHT },
+            facingMode: "user",
+          }}
           onUserMedia={() => setVideoStreamReady(true)}
           onUserMediaError={() => setVideoStreamReady(false)}
         />
