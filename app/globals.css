@@ -6,3 +6,42 @@ body {
   background: #0a0a0f;
   color: #e0e0e0;
 }
+
+.glide-theme .text-cyan-100,
+.glide-theme .text-cyan-200,
+.glide-theme .text-cyan-300,
+.glide-theme .text-cyan-400 {
+  color: var(--glide-accent-muted);
+}
+
+.glide-theme .border-cyan-300,
+.glide-theme .border-cyan-400,
+.glide-theme .border-cyan-500,
+.glide-theme .border-cyan-500\/60,
+.glide-theme .border-cyan-500\/70,
+.glide-theme .border-cyan-700,
+.glide-theme .border-cyan-900,
+.glide-theme .border-cyan-900\/60,
+.glide-theme .border-cyan-950 {
+  border-color: var(--glide-accent-border);
+}
+
+.glide-theme .bg-cyan-300,
+.glide-theme .bg-cyan-400 {
+  background-color: var(--glide-accent);
+}
+
+.glide-theme .bg-cyan-900,
+.glide-theme .bg-cyan-950,
+.glide-theme .bg-cyan-950\/70,
+.glide-theme .bg-cyan-950\/75 {
+  background-color: var(--glide-accent-soft);
+}
+
+.glide-theme .accent-cyan-400 {
+  accent-color: var(--glide-accent);
+}
+
+.glide-theme .focus-within\:border-cyan-700:focus-within {
+  border-color: var(--glide-focus);
+}

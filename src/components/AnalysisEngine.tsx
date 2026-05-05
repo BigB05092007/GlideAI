@@ -1,6 +1,7 @@
 'use client';
 // DONE BY VLAD AND A BIT OF CODEX
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import Webcam from "react-webcam";
 import type { NormalizedLandmark, Results } from "@mediapipe/pose";
 import {
@@ -58,6 +59,8 @@ interface EVFResult {
 
 type ArmSide = "left" | "right";
 type PredictionMode = "off" | "assist" | "extended";
+type CameraViewMode = "auto" | "top" | "side" | "top-side" | "front";
+type AnalysisView = Exclude<CameraViewMode, "auto"> | "unknown";
 type TrackingState = "live" | "limited" | "predicting" | "lost";
 type InterfaceStyle = "pro" | "pool" | "contrast";
 type PanelView = "dashboard" | "coach" | "settings" | "history";
@@ -78,7 +81,7 @@ interface TechniqueFeedback {
 
 interface ShoulderMetrics {
   visible: boolean;
-  view: "front" | "side" | "top" | "unknown";
+  view: AnalysisView;
   trackedSide: ArmSide | "both" | "none";
   slopeDegrees: number;
   width: number;
@@ -231,6 +234,7 @@ interface MotionTrails {
 
 interface TrackerSettings {
   predictionMode: PredictionMode;
+  viewMode: CameraViewMode;
   edgeGuard: boolean;
   showSkeleton: boolean;
   showJoints: boolean;
@@ -289,6 +293,7 @@ interface InterfaceStyleOption {
   videoClass: string;
   activeClass: string;
   cueClass: string;
+  vars: CSSProperties;
 }
 
 interface SessionMark {
@@ -386,6 +391,7 @@ const MEDIAPIPE_POSE_VERSION = "0.5.1675469404";
 const POSE_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${MEDIAPIPE_POSE_VERSION}/`;
 const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
   predictionMode: "assist",
+  viewMode: "auto",
   edgeGuard: true,
   showSkeleton: true,
   showJoints: true,
@@ -410,6 +416,13 @@ const STROKE_FOCUS_OPTIONS: readonly StrokeFocus[] = [
   "Butterfly",
   "Breaststroke",
 ];
+const CAMERA_VIEW_OPTIONS: readonly { id: CameraViewMode; label: string }[] = [
+  { id: "auto", label: "Auto" },
+  { id: "top", label: "Top" },
+  { id: "side", label: "Side" },
+  { id: "top-side", label: "Top 45" },
+  { id: "front", label: "Front" },
+];
 const INTERFACE_STYLE_OPTIONS: readonly InterfaceStyleOption[] = [
   {
     id: "pro",
@@ -419,6 +432,16 @@ const INTERFACE_STYLE_OPTIONS: readonly InterfaceStyleOption[] = [
     videoClass: "border-zinc-800 shadow-black/50",
     activeClass: "border-cyan-500/70 bg-cyan-950/70 text-cyan-100",
     cueClass: "border-cyan-500/60 bg-cyan-950/75 text-cyan-50",
+    vars: {
+      "--glide-accent": "#22d3ee",
+      "--glide-accent-soft": "rgba(8, 145, 178, 0.28)",
+      "--glide-accent-muted": "#67e8f9",
+      "--glide-accent-border": "rgba(14, 116, 144, 0.72)",
+      "--glide-panel": "rgba(9, 9, 11, 0.92)",
+      "--glide-panel-strong": "rgba(8, 47, 73, 0.42)",
+      "--glide-card-border": "rgba(39, 39, 42, 0.86)",
+      "--glide-focus": "#0891b2",
+    } as CSSProperties,
   },
   {
     id: "pool",
@@ -428,6 +451,16 @@ const INTERFACE_STYLE_OPTIONS: readonly InterfaceStyleOption[] = [
     videoClass: "border-sky-700/60 shadow-sky-950/30",
     activeClass: "border-sky-400/70 bg-sky-900/80 text-sky-50",
     cueClass: "border-sky-300/70 bg-sky-950/80 text-sky-50",
+    vars: {
+      "--glide-accent": "#38bdf8",
+      "--glide-accent-soft": "rgba(14, 165, 233, 0.26)",
+      "--glide-accent-muted": "#bae6fd",
+      "--glide-accent-border": "rgba(56, 189, 248, 0.72)",
+      "--glide-panel": "rgba(7, 22, 35, 0.92)",
+      "--glide-panel-strong": "rgba(12, 74, 110, 0.5)",
+      "--glide-card-border": "rgba(14, 116, 144, 0.62)",
+      "--glide-focus": "#0ea5e9",
+    } as CSSProperties,
   },
   {
     id: "contrast",
@@ -437,6 +470,16 @@ const INTERFACE_STYLE_OPTIONS: readonly InterfaceStyleOption[] = [
     videoClass: "border-amber-500/55 shadow-amber-950/20",
     activeClass: "border-amber-300/80 bg-amber-950/80 text-amber-50",
     cueClass: "border-amber-300/75 bg-black/85 text-amber-50",
+    vars: {
+      "--glide-accent": "#fbbf24",
+      "--glide-accent-soft": "rgba(180, 83, 9, 0.3)",
+      "--glide-accent-muted": "#fde68a",
+      "--glide-accent-border": "rgba(251, 191, 36, 0.76)",
+      "--glide-panel": "rgba(10, 10, 10, 0.94)",
+      "--glide-panel-strong": "rgba(69, 26, 3, 0.48)",
+      "--glide-card-border": "rgba(120, 113, 108, 0.68)",
+      "--glide-focus": "#d97706",
+    } as CSSProperties,
   },
 ];
 const SWIM_CONNECTIONS: readonly PoseConnection[] = [
@@ -665,6 +708,33 @@ function predictionModeLabel(mode: PredictionMode): string {
   if (mode === "extended") return "Extended";
   if (mode === "assist") return "Assist";
   return "Off";
+}
+
+function cameraViewModeLabel(mode: CameraViewMode): string {
+  if (mode === "auto") return "Auto";
+  if (mode === "top") return "Top";
+  if (mode === "side") return "Side";
+  if (mode === "top-side") return "Top 45";
+  return "Front";
+}
+
+function analysisViewLabel(view: AnalysisView): string {
+  if (view === "top") return "Top";
+  if (view === "side") return "Side";
+  if (view === "top-side") return "Top 45";
+  if (view === "front") return "Front";
+  if (view === "unknown") return "Unknown";
+  return "Unknown";
+}
+
+function cameraViewBadgeLabel(mode: CameraViewMode, view: AnalysisView | null): string {
+  if (mode !== "auto") return `${cameraViewModeLabel(mode)} View`;
+  if (!view || view === "unknown") return "Auto View";
+  return `${analysisViewLabel(view)} View`;
+}
+
+function isTopLikeView(view: AnalysisView): boolean {
+  return view === "top" || view === "top-side";
 }
 
 function isOutsideFrame(lm: NormalizedLandmark, margin = 0.015): boolean {
@@ -2033,11 +2103,12 @@ function selectCatchAxis(
   side: ArmSide,
   view: ShoulderMetrics["view"]
 ): CatchAxis {
-  if (view !== "top") return "y";
+  if (!isTopLikeView(view)) return "y";
 
   const xRange = Math.max(strokeRange.maxX - strokeRange.minX, motion[side].rangeX);
   const yRange = Math.max(strokeRange.maxY - strokeRange.minY, motion[side].rangeY);
-  return xRange > yRange * 1.15 ? "x" : "y";
+  const xDominance = view === "top-side" ? 0.95 : 1.15;
+  return xRange > yRange * xDominance ? "x" : "y";
 }
 
 function isInCatchWindow(
@@ -2066,12 +2137,24 @@ function isEVFGeometry(
   inCatchPhase: boolean,
   view: ShoulderMetrics["view"]
 ): boolean {
-  const useTopGeometry = view === "top";
-  const angleMin = useTopGeometry ? EVF_TOP_VIEW_ANGLE_MIN : EVF_ANGLE_MIN;
-  const angleMax = useTopGeometry ? EVF_TOP_VIEW_ANGLE_MAX : EVF_ANGLE_MAX;
-  const verticalityMin = useTopGeometry
-    ? EVF_TOP_VIEW_VERTICALITY_MIN
-    : EVF_VERTICALITY_MIN;
+  const angleMin =
+    view === "top"
+      ? EVF_TOP_VIEW_ANGLE_MIN
+      : view === "top-side"
+        ? 94
+        : EVF_ANGLE_MIN;
+  const angleMax =
+    view === "top"
+      ? EVF_TOP_VIEW_ANGLE_MAX
+      : view === "top-side"
+        ? 135
+        : EVF_ANGLE_MAX;
+  const verticalityMin =
+    view === "top"
+      ? EVF_TOP_VIEW_VERTICALITY_MIN
+      : view === "top-side"
+        ? 62
+        : EVF_VERTICALITY_MIN;
 
   return (
     elbowAngle >= angleMin &&
@@ -2109,7 +2192,7 @@ function checkEVFForArm(
   const S: Point = { x: shoulder.x, y: shoulder.y };
   const E: Point = { x: elbow.x, y: elbow.y };
   const W: Point = { x: wrist.x, y: wrist.y };
-  const useTopGeometry = view === "top";
+  const useTopGeometry = isTopLikeView(view);
   const elbowAngle = angleBetweenPoints(S, E, W);
   const verticality = forearmVerticality(toPoint3D(elbow), toPoint3D(wrist), useTopGeometry);
   const inCatchPhase = isInCatchWindow(wrist, strokeRange, axis, useTopGeometry);
@@ -2349,6 +2432,23 @@ function getShoulderMetrics(
   };
 }
 
+function resolveCameraViewMetrics(
+  autoMetrics: ShoulderMetrics,
+  viewMode: CameraViewMode
+): ShoulderMetrics {
+  if (viewMode === "auto") return autoMetrics;
+
+  const sideTracked =
+    autoMetrics.trackedSide === "none" ? "both" : autoMetrics.trackedSide;
+
+  return {
+    ...autoMetrics,
+    view: viewMode,
+    trackedSide:
+      viewMode === "side" || viewMode === "top-side" ? sideTracked : "both",
+  };
+}
+
 function classifyStroke(
   landmarks: NormalizedLandmark[],
   shoulders: ShoulderMetrics,
@@ -2368,7 +2468,7 @@ function classifyStroke(
   if (!primaryArm) {
     return {
       stroke: "Unknown",
-      confidence: shoulders.view === "top" ? 0.28 : 0,
+      confidence: isTopLikeView(shoulders.view) ? 0.28 : 0,
     };
   }
 
@@ -2378,7 +2478,7 @@ function classifyStroke(
     isVisible(leftElbow, LANDMARK_PARTIAL_VISIBILITY) &&
     isVisible(rightElbow, LANDMARK_PARTIAL_VISIBILITY);
 
-  if (shoulders.view === "top") {
+  if (isTopLikeView(shoulders.view)) {
     const leftSignal = getArmSignal(landmarks, "left", profile);
     const rightSignal = getArmSignal(landmarks, "right", profile);
     const visibleArmCount = [leftSignal.partial, rightSignal.partial].filter(Boolean).length;
@@ -2391,7 +2491,8 @@ function classifyStroke(
       const shoulderWidth = Math.max(shoulders.width, 0.08);
       const xDominant =
         motion.left.rangeX + motion.right.rangeX >
-        (motion.left.rangeY + motion.right.rangeY) * 1.15;
+        (motion.left.rangeY + motion.right.rangeY) *
+          (shoulders.view === "top-side" ? 0.95 : 1.15);
       const wristDelta = xDominant
         ? Math.abs(leftWrist.x - rightWrist.x)
         : Math.abs(leftWrist.y - rightWrist.y);
@@ -2399,7 +2500,22 @@ function classifyStroke(
         ? Math.abs(leftElbow.x - rightElbow.x)
         : Math.abs(leftElbow.y - rightElbow.y);
       const armsSynchronized =
-        wristDelta < shoulderWidth * 0.85 && elbowDelta < shoulderWidth * 0.85;
+        wristDelta < shoulderWidth * 0.9 && elbowDelta < shoulderWidth * 0.9;
+
+      if (shoulders.view === "top-side") {
+        const leftAboveShoulders = leftWrist.y < shoulders.centerY;
+        const rightAboveShoulders = rightWrist.y < shoulders.centerY;
+        const bothAboveShoulders = leftAboveShoulders && rightAboveShoulders;
+        const bothBelowShoulders = !leftAboveShoulders && !rightAboveShoulders;
+
+        if (armsSynchronized && bothAboveShoulders && hasStrokeMotion) {
+          return { stroke: "Butterfly", confidence: 0.66 };
+        }
+
+        if (armsSynchronized && bothBelowShoulders && hasStrokeMotion) {
+          return { stroke: "Breaststroke", confidence: 0.64 };
+        }
+      }
 
       if (armsSynchronized && hasStrokeMotion) {
         return { stroke: "Butterfly", confidence: 0.68 };
@@ -2491,6 +2607,16 @@ function buildTechniqueFeedback(
       message: primarySignal?.complete
         ? "Top-view tracking: overhead shoulder, hip, and arm geometry locked."
         : "Top-view partial tracking: holding visible body landmarks through water occlusion.",
+    });
+  } else if (shoulders.view === "top-side") {
+    feedback.push({
+      id: "top-side-view",
+      severity: primaryArm ? "good" : "warning",
+      message: primaryArm
+        ? primarySignal?.complete
+          ? `Top-side 45 tracking: blending overhead path and ${primaryArm} arm geometry.`
+          : `Top-side 45 tracking: holding visible ${primaryArm} arm motion.`
+        : "Top-side 45 view selected; keep at least one arm path in frame.",
     });
   } else if (shoulders.view === "side") {
     feedback.push({
@@ -3065,24 +3191,27 @@ function statusDotClass(active: boolean) {
 function metricCardClass(accent: "cyan" | "emerald" | "amber" | "zinc" = "zinc") {
   const accentClass =
     accent === "cyan"
-      ? "border-cyan-900/60"
+      ? "border-[color:var(--glide-accent-border)] bg-[color:var(--glide-panel-strong)]"
       : accent === "emerald"
         ? "border-emerald-900/60"
         : accent === "amber"
           ? "border-amber-900/60"
-          : "border-zinc-800/80";
+          : "border-[color:var(--glide-card-border)] bg-[color:var(--glide-panel)]";
 
-  return `rounded-lg bg-zinc-950/90 border ${accentClass} p-4 shadow-lg shadow-black/35`;
+  const semanticBg =
+    accent === "emerald" || accent === "amber" ? "bg-[color:var(--glide-panel)]" : "";
+
+  return `rounded-lg border ${accentClass} ${semanticBg} p-4 shadow-lg shadow-black/35`;
 }
 
 function controlButtonClass(active: boolean) {
   return active
-    ? "border-cyan-500/70 bg-cyan-950/70 text-cyan-100"
+    ? "border-[color:var(--glide-accent-border)] bg-[color:var(--glide-accent-soft)] text-[color:var(--glide-accent-muted)]"
     : "border-zinc-800 bg-zinc-900/70 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200";
 }
 
 function chainDotClass(active: boolean) {
-  return active ? "bg-cyan-300" : "bg-zinc-700";
+  return active ? "bg-[color:var(--glide-accent)]" : "bg-zinc-700";
 }
 
 function ReferencePicture({ type }: { type: "evf" | "top" | "water" }) {
@@ -3280,7 +3409,7 @@ function MetricsPanel({
   const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
   const profileGeometry = createProfileGeometry(swimmerProfile);
   const coachCue = getPrimaryCue(analysis, strokeFocus);
-  const topViewActive = technique?.shoulders.view === "top";
+  const topViewActive = isTopLikeView(technique?.shoulders.view ?? "unknown");
   const partialSubmersionActive = Boolean(
     technique?.feedback.some((item) => item.id === "partial-submerged")
   );
@@ -3307,13 +3436,9 @@ function MetricsPanel({
       }`;
   const viewLabel = !technique
     ? "--"
-    : technique.shoulders.view === "top"
-      ? "Top"
-      : technique.shoulders.view === "side"
-        ? "Side"
-        : technique.shoulders.visible
-          ? `${technique.shoulders.slopeDegrees.toFixed(1)} deg`
-          : "--";
+    : technique.shoulders.visible
+      ? analysisViewLabel(technique.shoulders.view)
+      : "--";
   const qualityPercent = Math.round((tracking?.quality ?? 0) * 100);
   const trackingStateLabel = tracking
     ? tracking.state === "predicting"
@@ -3839,6 +3964,34 @@ function MetricsPanel({
         </div>
       </div>
 
+      <div className={metricCardClass(trackerSettings.viewMode === "auto" ? "zinc" : "cyan")}>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Eye className="h-4 w-4 text-cyan-400" />
+            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+              Camera View
+            </span>
+          </div>
+          <span className="text-xs font-semibold text-cyan-300">
+            {cameraViewModeLabel(trackerSettings.viewMode)}
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {CAMERA_VIEW_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => onTrackerSettingsChange({ viewMode: option.id })}
+              className={`rounded-md border px-2 py-2 text-xs font-semibold transition ${controlButtonClass(
+                trackerSettings.viewMode === option.id
+              )}`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className={metricCardClass(tracking?.state === "predicting" ? "amber" : "zinc")}>
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -4084,7 +4237,7 @@ function MetricsPanel({
       </div>
 
       <ReferenceCard title="EVF Picture" type="evf" active={anyEVF} />
-      <ReferenceCard title="Top View" type="top" active={topViewActive} />
+      <ReferenceCard title="Top / 45 View" type="top" active={topViewActive} />
       <ReferenceCard
         title="Submerged Hand"
         type="water"
@@ -4304,15 +4457,22 @@ export default function AnalysisEngine() {
 
   const handleTrackerSettingsChange = useCallback(
     (patch: Partial<TrackerSettings>) => {
-      const nextSettings = { ...trackerSettingsRef.current, ...patch };
+      const previousSettings = trackerSettingsRef.current;
+      const viewModeChanged =
+        patch.viewMode !== undefined && patch.viewMode !== previousSettings.viewMode;
+      const nextSettings = { ...previousSettings, ...patch };
       trackerSettingsRef.current = nextSettings;
       setTrackerSettings(nextSettings);
 
       if (patch.predictionMode === "off") {
         missingFramesRef.current = 0;
       }
+
+      if (viewModeChanged) {
+        resetTrackingMemory();
+      }
     },
-    []
+    [resetTrackingMemory]
   );
 
   const handleStyleCheckIntervalChange = useCallback((intervalMs: number) => {
@@ -4475,7 +4635,10 @@ export default function AnalysisEngine() {
     const lm = activeArm ? suppressArm(identified, oppositeArm(activeArm)) : identified;
 
     const motion = updateMotionHistory(motionHistoryRef.current, lm);
-    const shoulders = getShoulderMetrics(lm, swimmerProfile);
+    const shoulders = resolveCameraViewMetrics(
+      getShoulderMetrics(lm, swimmerProfile),
+      settings.viewMode
+    );
     const sr = strokeRangeRef.current;
     updateStrokeRange(sr, lm);
 
@@ -4680,7 +4843,8 @@ export default function AnalysisEngine() {
 
   return (
     <div
-      className={`glide-shell flex min-h-[calc(100vh-9rem)] w-full flex-col gap-5 rounded-lg p-1 ${selectedInterfaceStyle.shellClass} xl:flex-row xl:items-start`}
+      className={`glide-shell glide-theme flex min-h-[calc(100vh-9rem)] w-full flex-col gap-5 rounded-lg p-1 ${selectedInterfaceStyle.shellClass} xl:flex-row xl:items-start`}
+      style={selectedInterfaceStyle.vars}
     >
       <div
         className={`relative min-h-[360px] w-full flex-1 overflow-hidden rounded-lg border bg-black shadow-2xl sm:min-h-[460px] xl:min-h-[calc(100vh-9rem)] ${selectedInterfaceStyle.videoClass}`}
@@ -4712,11 +4876,10 @@ export default function AnalysisEngine() {
         />
         <div className="pointer-events-none absolute left-4 top-4 z-[105] flex flex-wrap gap-2">
           <span className="rounded-md border border-zinc-700/80 bg-black/60 px-2.5 py-1 text-xs font-medium text-zinc-200 backdrop-blur-md">
-            {analysisState?.technique.shoulders.view === "top"
-              ? "Top View"
-              : analysisState?.technique.shoulders.view === "side"
-                ? "Side View"
-                : "Live View"}
+            {cameraViewBadgeLabel(
+              trackerSettings.viewMode,
+              analysisState?.technique.shoulders.view ?? null
+            )}
           </span>
           <span className="rounded-md border border-zinc-700/80 bg-black/60 px-2.5 py-1 text-xs font-medium text-zinc-200 backdrop-blur-md">
             Arms {analysisState?.armIdentity.locked ? "Locked" : "Learning"}
