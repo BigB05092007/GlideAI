@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "GlideAI — Aquatic Intelligence",
+  title: "GlideAI - Aquatic Intelligence",
   description: "Institutional-grade swim biomechanics powered by on-device AI",
 };
 

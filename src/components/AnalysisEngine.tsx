@@ -6,16 +6,30 @@ import type { NormalizedLandmark, Results } from "@mediapipe/pose";
 import {
   Activity,
   AlertTriangle,
+  BookmarkPlus,
   Brain,
   Camera,
+  CameraOff,
   Clock,
+  ClipboardList,
   Gauge,
   Hand,
   Eye,
+  Menu,
+  Minus,
+  Palette,
+  PanelRightClose,
+  PanelRightOpen,
+  Pause,
+  Play,
+  Plus,
   RotateCcw,
   ShieldCheck,
   SlidersHorizontal,
+  SwitchCamera,
   Target,
+  Timer,
+  Trophy,
   Zap,
 } from "lucide-react";
 
@@ -45,6 +59,8 @@ interface EVFResult {
 type ArmSide = "left" | "right";
 type PredictionMode = "off" | "assist" | "extended";
 type TrackingState = "live" | "limited" | "predicting" | "lost";
+type InterfaceStyle = "pro" | "pool" | "contrast";
+type PanelView = "dashboard" | "coach" | "settings" | "history";
 
 type StrokeType =
   | "Freestyle"
@@ -52,6 +68,7 @@ type StrokeType =
   | "Butterfly"
   | "Breaststroke"
   | "Unknown";
+type StrokeFocus = Exclude<StrokeType, "Unknown"> | "Auto";
 
 interface TechniqueFeedback {
   id: string;
@@ -218,6 +235,8 @@ interface TrackerSettings {
   showSkeleton: boolean;
   showJoints: boolean;
   showTrails: boolean;
+  showCoachCues: boolean;
+  mirrored: boolean;
   overlayOpacity: number;
 }
 
@@ -232,6 +251,7 @@ interface OverlayMetrics {
   width: number;
   height: number;
   videoRect: VideoRect;
+  mirrored: boolean;
 }
 
 interface ArmSignal {
@@ -261,6 +281,46 @@ type CatchAxis = "x" | "y";
 type StyleResult = Pick<TechniqueAnalysis, "stroke" | "confidence">;
 type PoseConstructorConfig = { locateFile?: (f: string) => string };
 
+interface InterfaceStyleOption {
+  id: InterfaceStyle;
+  label: string;
+  description: string;
+  shellClass: string;
+  videoClass: string;
+  activeClass: string;
+  cueClass: string;
+}
+
+interface SessionMark {
+  id: number;
+  timeLabel: string;
+  stroke: StrokeType;
+  quality: number;
+  evfConfidence: number;
+  cue: string;
+}
+
+interface SwimmerProfile {
+  heightIn: number;
+  weightLb: number;
+  armSpanIn: number;
+  upperArmIn: number;
+  forearmIn: number;
+  shoulderWidthIn: number;
+  profileInfluence: number;
+}
+
+interface ProfileGeometry {
+  armRatioMin: number;
+  armRatioMax: number;
+  expectedArmRatio: number;
+  minArmSignalScore: number;
+  completeArmSignalScore: number;
+  sideViewShoulderThreshold: number;
+  topArmReachFactor: number;
+  bodyMassSignalBias: number;
+}
+
 interface PoseInstance {
   setOptions: (o: Record<string, unknown>) => void;
   onResults: (cb: (r: Results) => void) => void;
@@ -278,8 +338,8 @@ const EVF_VERTICALITY_MIN = 70;
 const EVF_TOP_VIEW_VERTICALITY_MIN = 58;
 const CATCH_PHASE_THRESHOLD = 0.3;
 const CATCH_PHASE_EDGE_THRESHOLD = 0.28;
-const STROKE_RANGE_DECAY = 0.005;
-const LANDMARK_SMOOTHING_ALPHA = 0.44;
+const STROKE_RANGE_DECAY = 0.0025;
+const LANDMARK_SMOOTHING_ALPHA = 0.34;
 const LANDMARK_RELIABLE_VISIBILITY = 0.5;
 const LANDMARK_PARTIAL_VISIBILITY = 0.22;
 const LANDMARK_DRAW_VISIBILITY = 0.24;
@@ -289,20 +349,18 @@ const RELIABLE_JUMP_LIMIT = 0.24;
 const ASSIST_PREDICTION_HOLD_FRAMES = 8;
 const EXTENDED_PREDICTION_HOLD_FRAMES = 22;
 const MOTION_HISTORY_LENGTH = 42;
-const DEFAULT_STYLE_CHECK_INTERVAL_MS = 8000;
+const DEFAULT_STYLE_CHECK_INTERVAL_MS = 5000;
 const MIN_STYLE_CHECK_INTERVAL_MS = 3000;
 const MAX_STYLE_CHECK_INTERVAL_MS = 15000;
 const STYLE_CHECK_INTERVAL_STEP_MS = 1000;
-const STROKE_ACQUIRE_CHECKS = 1;
+const STROKE_ACQUIRE_CHECKS = 2;
 const STROKE_SWITCH_CHECKS = 4;
 const STROKE_MEMORY_HOLD_CHECKS = 5;
 const ACTIVE_ARM_ACQUIRE_FRAMES = 8;
 const ACTIVE_ARM_SWITCH_FRAMES = 48;
 const ACTIVE_ARM_HOLD_FRAMES = 45;
 const ARM_IDENTITY_ACQUIRE_FRAMES = 8;
-const ARM_IDENTITY_SWITCH_FRAMES = 30;
 const ARM_IDENTITY_HOLD_FRAMES = 45;
-const ARM_IDENTITY_SWAP_MARGIN = 0.085;
 const ARM_IDENTITY_ANCHOR_ALPHA = 0.08;
 const UI_UPDATE_INTERVAL_MS = 250;
 const MIN_ARM_SIGNAL_SCORE = 0.62;
@@ -327,13 +385,60 @@ const SHOULDER_LINE = "rgba(250, 204, 21, 0.95)";
 const MEDIAPIPE_POSE_VERSION = "0.5.1675469404";
 const POSE_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${MEDIAPIPE_POSE_VERSION}/`;
 const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
-  predictionMode: "off",
+  predictionMode: "assist",
   edgeGuard: true,
   showSkeleton: true,
   showJoints: true,
   showTrails: true,
+  showCoachCues: true,
+  mirrored: true,
   overlayOpacity: 0.9,
 };
+const DEFAULT_SWIMMER_PROFILE: SwimmerProfile = {
+  heightIn: 70,
+  weightLb: 165,
+  armSpanIn: 70,
+  upperArmIn: 13,
+  forearmIn: 11,
+  shoulderWidthIn: 17,
+  profileInfluence: 55,
+};
+const STROKE_FOCUS_OPTIONS: readonly StrokeFocus[] = [
+  "Auto",
+  "Freestyle",
+  "Backstroke",
+  "Butterfly",
+  "Breaststroke",
+];
+const INTERFACE_STYLE_OPTIONS: readonly InterfaceStyleOption[] = [
+  {
+    id: "pro",
+    label: "Pro",
+    description: "Dense analysis with cyan and emerald accents.",
+    shellClass: "bg-zinc-950",
+    videoClass: "border-zinc-800 shadow-black/50",
+    activeClass: "border-cyan-500/70 bg-cyan-950/70 text-cyan-100",
+    cueClass: "border-cyan-500/60 bg-cyan-950/75 text-cyan-50",
+  },
+  {
+    id: "pool",
+    label: "Poolside",
+    description: "Brighter deck-style contrast for quick scanning.",
+    shellClass: "bg-sky-950/40",
+    videoClass: "border-sky-700/60 shadow-sky-950/30",
+    activeClass: "border-sky-400/70 bg-sky-900/80 text-sky-50",
+    cueClass: "border-sky-300/70 bg-sky-950/80 text-sky-50",
+  },
+  {
+    id: "contrast",
+    label: "Contrast",
+    description: "Higher contrast labels and amber highlights.",
+    shellClass: "bg-neutral-950",
+    videoClass: "border-amber-500/55 shadow-amber-950/20",
+    activeClass: "border-amber-300/80 bg-amber-950/80 text-amber-50",
+    cueClass: "border-amber-300/75 bg-black/85 text-amber-50",
+  },
+];
 const SWIM_CONNECTIONS: readonly PoseConnection[] = [
   [11, 12],
   [11, 13],
@@ -415,6 +520,60 @@ function clamp01(value: number): number {
   return clamp(value, 0, 1);
 }
 
+function mix(start: number, end: number, amount: number): number {
+  return start * (1 - amount) + end * amount;
+}
+
+function createProfileGeometry(profile: SwimmerProfile): ProfileGeometry {
+  const influence = clamp(profile.profileInfluence / 100, 0, 1);
+  const expectedArmRatio = clamp(
+    profile.forearmIn / Math.max(profile.upperArmIn, 1),
+    0.55,
+    1.35
+  );
+  const armSpanRatio = clamp(
+    profile.armSpanIn / Math.max(profile.heightIn, 1),
+    0.82,
+    1.18
+  );
+  const shoulderRatio = clamp(
+    profile.shoulderWidthIn / Math.max(profile.heightIn, 1),
+    0.18,
+    0.34
+  );
+  const bodyMassIndex =
+    (profile.weightLb / Math.max(profile.heightIn * profile.heightIn, 1)) * 703;
+  const bodyMassSignalBias =
+    bodyMassIndex > 28 ? -0.04 : bodyMassIndex < 19 ? 0.03 : 0;
+
+  return {
+    expectedArmRatio,
+    armRatioMin: clamp(
+      mix(ARM_RATIO_MIN, expectedArmRatio * 0.52, influence),
+      ARM_RATIO_MIN,
+      1.05
+    ),
+    armRatioMax: clamp(
+      mix(ARM_RATIO_MAX, expectedArmRatio * 1.9, influence),
+      0.95,
+      ARM_RATIO_MAX
+    ),
+    minArmSignalScore: clamp(
+      MIN_ARM_SIGNAL_SCORE + bodyMassSignalBias + influence * 0.03,
+      0.52,
+      0.75
+    ),
+    completeArmSignalScore: clamp(1.35 + bodyMassSignalBias + influence * 0.05, 1.18, 1.5),
+    sideViewShoulderThreshold: clamp(
+      SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD * mix(1, shoulderRatio / 0.24, influence),
+      0.048,
+      0.078
+    ),
+    topArmReachFactor: clamp(0.65 * mix(1, armSpanRatio, influence), 0.55, 0.82),
+    bodyMassSignalBias,
+  };
+}
+
 function limitStep(previous: number, current: number, maxStep: number): number {
   return previous + clamp(current - previous, -maxStep, maxStep);
 }
@@ -450,7 +609,8 @@ function getCoverRect(
 function prepareOverlayCanvas(
   canvas: HTMLCanvasElement,
   ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement | undefined
+  video: HTMLVideoElement | undefined,
+  mirrored: boolean
 ): OverlayMetrics {
   const width = Math.max(1, canvas.clientWidth || video?.clientWidth || VIDEO_WIDTH);
   const height = Math.max(1, canvas.clientHeight || video?.clientHeight || VIDEO_HEIGHT);
@@ -468,6 +628,7 @@ function prepareOverlayCanvas(
   return {
     width,
     height,
+    mirrored,
     videoRect: getCoverRect(
       width,
       height,
@@ -486,9 +647,10 @@ function projectLandmark(
 
 function projectNormalizedPoint(point: Point, metrics: OverlayMetrics): Point {
   const { videoRect } = metrics;
+  const x = metrics.mirrored ? 1 - point.x : point.x;
 
   return {
-    x: videoRect.x + (1 - point.x) * videoRect.width,
+    x: videoRect.x + x * videoRect.width,
     y: videoRect.y + point.y * videoRect.height,
   };
 }
@@ -753,12 +915,7 @@ function handIndices(side: ArmSide): readonly number[] {
 
 function fullSideIndices(side: ArmSide): readonly number[] {
   const indices = armIndices(side);
-  return [
-    indices.shoulder,
-    indices.elbow,
-    indices.wrist,
-    ...handIndices(side),
-  ];
+  return [indices.shoulder, indices.elbow, indices.wrist];
 }
 
 function oppositeArm(side: ArmSide): ArmSide {
@@ -815,9 +972,13 @@ function stabilizeHandEndpoint(
     handIndices(side),
     HAND_PROXY_VISIBILITY
   );
+  const wristVisibility = landmarkVisibility(wrist);
+  const wristReliable = isTrackableLandmark(wrist, LANDMARK_RELIABLE_VISIBILITY);
+  const wristPartial = isTrackableLandmark(wrist, LANDMARK_PARTIAL_VISIBILITY);
 
+  if (wristReliable) return;
   if (!handProxy || !isVisible(elbow, LANDMARK_DRAW_VISIBILITY)) return;
-  if (visibleHandCount < 2 && !isVisible(wrist, LANDMARK_PARTIAL_VISIBILITY)) return;
+  if (visibleHandCount < 2) return;
 
   let target = handProxy;
   const handDistance = distance(elbow, handProxy);
@@ -825,7 +986,6 @@ function stabilizeHandEndpoint(
     isVisible(shoulder, LANDMARK_DRAW_VISIBILITY) && isVisible(elbow, LANDMARK_DRAW_VISIBILITY)
       ? distance(shoulder, elbow)
       : 0;
-  const wristVisibility = landmarkVisibility(wrist);
   const wristDistance =
     wrist && isVisible(wrist, LANDMARK_DRAW_VISIBILITY) ? distance(elbow, wrist) : 0;
   const baseLength = upperArmLength > 0 ? upperArmLength : wristDistance;
@@ -842,30 +1002,25 @@ function stabilizeHandEndpoint(
     target = limitLandmarkJump(elbow, handProxy, maxForearmLength);
   }
 
-  const wristToProxy = wrist ? landmarkDistance(wrist, target) : 0;
-  const proxyDisagreesWithReliableWrist =
-    wristVisibility >= LANDMARK_RELIABLE_VISIBILITY &&
-    wristToProxy > Math.max(0.07, Math.max(wristDistance, minForearmLength) * 0.75);
-  const proxyWeight =
-    proxyDisagreesWithReliableWrist
-      ? 0.08
-      : wristVisibility >= LANDMARK_RELIABLE_VISIBILITY
-      ? 0.28
-      : wristVisibility >= LANDMARK_PARTIAL_VISIBILITY
-        ? 0.58
-        : 0.9;
-  const base = wrist ?? handProxy;
+  if (wristPartial && wrist) {
+    const wristToProxy = landmarkDistance(wrist, target);
+    const allowedProxyDrift = Math.max(0.035, Math.max(wristDistance, minForearmLength) * 0.45);
 
-  landmarks[indices.wrist] = blendLandmarks(
-    base,
-    target,
-    proxyWeight,
-    Math.max(
-      wristVisibility * 0.9,
-      landmarkVisibility(target),
-      HAND_PROXY_VISIBILITY
-    )
-  );
+    if (wristToProxy > allowedProxyDrift) return;
+
+    landmarks[indices.wrist] = blendLandmarks(
+      wrist,
+      target,
+      0.12,
+      Math.max(wristVisibility, HAND_PROXY_VISIBILITY)
+    );
+    return;
+  }
+
+  landmarks[indices.wrist] = {
+    ...target,
+    visibility: Math.min(0.42, Math.max(HAND_PROXY_VISIBILITY, landmarkVisibility(target) * 0.72)),
+  };
 }
 
 function enhanceSwimLandmarks(landmarks: NormalizedLandmark[]): NormalizedLandmark[] {
@@ -888,25 +1043,6 @@ function getArmAnchor(
   );
 
   return anchor ? { x: anchor.x, y: anchor.y } : null;
-}
-
-function swapBodySides(landmarks: NormalizedLandmark[]): NormalizedLandmark[] {
-  const swapped = landmarks.map((landmark) => cloneLandmark(landmark));
-
-  for (const [leftIndex, rightIndex] of [
-    [11, 12],
-    [13, 14],
-    [15, 16],
-    [17, 18],
-    [19, 20],
-    [21, 22],
-    [23, 24],
-  ] as const) {
-    swapped[leftIndex] = cloneLandmark(landmarks[rightIndex]);
-    swapped[rightIndex] = cloneLandmark(landmarks[leftIndex]);
-  }
-
-  return swapped;
 }
 
 function createArmIdentityStatus(
@@ -936,62 +1072,30 @@ function createArmIdentityStatus(
 
 function resolveArmIdentityLandmarks(
   landmarks: NormalizedLandmark[],
-  memory: ArmIdentityMemory
+  memory: ArmIdentityMemory,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): ArmIdentityResolution {
-  const rawLeftAnchor = getArmAnchor(landmarks, "left");
-  const rawRightAnchor = getArmAnchor(landmarks, "right");
-  const rawLeftSignal = getArmSignal(landmarks, "left");
-  const rawRightSignal = getArmSignal(landmarks, "right");
-  let holdAnchorUpdate = false;
-  let swappedChanged = false;
-
-  if (
-    rawLeftAnchor &&
-    rawRightAnchor &&
+  const profileGeometry = createProfileGeometry(profile);
+  const rawLeftSignal = getArmSignal(landmarks, "left", profile);
+  const rawRightSignal = getArmSignal(landmarks, "right", profile);
+  const mapped = landmarks.map(cloneLandmark);
+  const mappedLeftAnchor = getArmAnchor(mapped, "left");
+  const mappedRightAnchor = getArmAnchor(mapped, "right");
+  const hasStableTwoArmFrame = Boolean(
+    mappedLeftAnchor &&
+    mappedRightAnchor &&
     rawLeftSignal.complete &&
     rawRightSignal.complete &&
-    rawLeftSignal.score >= 1.35 &&
-    rawRightSignal.score >= 1.35
-  ) {
+    rawLeftSignal.score >= profileGeometry.completeArmSignalScore &&
+    rawRightSignal.score >= profileGeometry.completeArmSignalScore
+  );
+
+  if (hasStableTwoArmFrame) {
     memory.missingFrames = 0;
     memory.observedFrames += 1;
-
-    if (memory.leftAnchor && memory.rightAnchor) {
-      const keepCost =
-        distance(rawLeftAnchor, memory.leftAnchor) +
-        distance(rawRightAnchor, memory.rightAnchor);
-      const swapCost =
-        distance(rawRightAnchor, memory.leftAnchor) +
-        distance(rawLeftAnchor, memory.rightAnchor);
-      const costDelta = keepCost - swapCost;
-      const desiredSwap =
-        costDelta > ARM_IDENTITY_SWAP_MARGIN
-          ? true
-          : costDelta < -ARM_IDENTITY_SWAP_MARGIN
-            ? false
-            : memory.swap;
-
-      if (desiredSwap !== memory.swap) {
-        holdAnchorUpdate = true;
-        if (memory.candidateSwap === desiredSwap) {
-          memory.candidateFrames += 1;
-        } else {
-          memory.candidateSwap = desiredSwap;
-          memory.candidateFrames = 1;
-        }
-
-        if (memory.candidateFrames >= ARM_IDENTITY_SWITCH_FRAMES) {
-          memory.swap = desiredSwap;
-          memory.candidateSwap = null;
-          memory.candidateFrames = 0;
-          holdAnchorUpdate = false;
-          swappedChanged = true;
-        }
-      } else {
-        memory.candidateSwap = null;
-        memory.candidateFrames = 0;
-      }
-    }
+    memory.swap = false;
+    memory.candidateSwap = null;
+    memory.candidateFrames = 0;
   } else {
     memory.missingFrames += 1;
 
@@ -1009,11 +1113,7 @@ function resolveArmIdentityLandmarks(
     memory.locked = true;
   }
 
-  const mapped = memory.swap ? swapBodySides(landmarks) : landmarks.map(cloneLandmark);
-  const mappedLeftAnchor = getArmAnchor(mapped, "left");
-  const mappedRightAnchor = getArmAnchor(mapped, "right");
-
-  if (mappedLeftAnchor && !holdAnchorUpdate) {
+  if (mappedLeftAnchor) {
     memory.leftAnchor = smoothPoint(
       memory.leftAnchor,
       mappedLeftAnchor,
@@ -1021,7 +1121,7 @@ function resolveArmIdentityLandmarks(
     );
   }
 
-  if (mappedRightAnchor && !holdAnchorUpdate) {
+  if (mappedRightAnchor) {
     memory.rightAnchor = smoothPoint(
       memory.rightAnchor,
       mappedRightAnchor,
@@ -1036,7 +1136,7 @@ function resolveArmIdentityLandmarks(
       Boolean(mappedLeftAnchor),
       Boolean(mappedRightAnchor)
     ),
-    swappedChanged,
+    swappedChanged: false,
   };
 }
 
@@ -1083,7 +1183,12 @@ function syncEnhancedArmEndpointMemory(
   syncEnhancedEndpointMemory(memory, landmarks, 16);
 }
 
-function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal {
+function getArmSignal(
+  landmarks: NormalizedLandmark[],
+  side: ArmSide,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): ArmSignal {
+  const profileGeometry = createProfileGeometry(profile);
   const indices = armIndices(side);
   const shoulder = landmarks[indices.shoulder];
   const elbow = landmarks[indices.elbow];
@@ -1093,7 +1198,7 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
   const hasWrist = isTrackableLandmark(wrist, LANDMARK_PARTIAL_VISIBILITY);
   const visibleCount = [hasShoulder, hasElbow, hasWrist].filter(Boolean).length;
 
-  if (visibleCount < 2) {
+  if (visibleCount < 2 || !hasElbow || (!hasShoulder && !hasWrist)) {
     return {
       score: 0,
       complete: false,
@@ -1114,7 +1219,8 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
     !hasUpperArm || (upperArm >= ARM_SEGMENT_MIN && upperArm <= UPPER_ARM_SEGMENT_MAX);
   const ratio = hasForearm && hasUpperArm && upperArm > 0 ? forearm / upperArm : 1;
   const ratioOk =
-    !(hasForearm && hasUpperArm) || (ratio >= ARM_RATIO_MIN && ratio <= ARM_RATIO_MAX);
+    !(hasForearm && hasUpperArm) ||
+    (ratio >= profileGeometry.armRatioMin && ratio <= profileGeometry.armRatioMax);
 
   if (!forearmOk || !upperArmOk || !ratioOk) {
     return {
@@ -1132,7 +1238,10 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
     (hasElbow ? landmarkVisibility(elbow) : 0) +
     (hasWrist ? landmarkVisibility(wrist) : 0) +
     (hasForearm ? 0.18 : 0) +
-    (hasShoulder && hasWrist ? 0.12 : 0);
+    (hasShoulder && hasWrist ? 0.12 : 0) -
+    (hasForearm && hasUpperArm
+      ? Math.min(Math.abs(ratio - profileGeometry.expectedArmRatio), 0.5) * 0.12
+      : 0);
 
   return {
     score: rawScore,
@@ -1144,26 +1253,45 @@ function getArmSignal(landmarks: NormalizedLandmark[], side: ArmSide): ArmSignal
   };
 }
 
-function armVisibilityScore(landmarks: NormalizedLandmark[], side: ArmSide) {
-  return getArmSignal(landmarks, side).score;
+function armVisibilityScore(
+  landmarks: NormalizedLandmark[],
+  side: ArmSide,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+) {
+  return getArmSignal(landmarks, side, profile).score;
 }
 
-function armHasCompleteChain(landmarks: NormalizedLandmark[], side: ArmSide) {
-  return getArmSignal(landmarks, side).complete;
+function armHasCompleteChain(
+  landmarks: NormalizedLandmark[],
+  side: ArmSide,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+) {
+  return getArmSignal(landmarks, side, profile).complete;
 }
 
-function pickPrimaryArm(landmarks: NormalizedLandmark[]): ArmSide | null {
-  const leftScore = armVisibilityScore(landmarks, "left");
-  const rightScore = armVisibilityScore(landmarks, "right");
+function pickPrimaryArm(
+  landmarks: NormalizedLandmark[],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): ArmSide | null {
+  const profileGeometry = createProfileGeometry(profile);
+  const leftScore = armVisibilityScore(landmarks, "left", profile);
+  const rightScore = armVisibilityScore(landmarks, "right", profile);
 
-  if (leftScore < MIN_ARM_SIGNAL_SCORE && rightScore < MIN_ARM_SIGNAL_SCORE) return null;
+  if (
+    leftScore < profileGeometry.minArmSignalScore &&
+    rightScore < profileGeometry.minArmSignalScore
+  ) {
+    return null;
+  }
   return leftScore >= rightScore ? "left" : "right";
 }
 
 function isUsablePoseFrame(
   landmarks: NormalizedLandmark[],
-  settings: TrackerSettings
+  settings: TrackerSettings,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): boolean {
+  const profileGeometry = createProfileGeometry(profile);
   const visibleUpperBody = [11, 12, 13, 14, 15, 16, 23, 24].filter((index) =>
     isTrackableLandmark(landmarks[index], LANDMARK_PARTIAL_VISIBILITY)
   ).length;
@@ -1179,11 +1307,11 @@ function isUsablePoseFrame(
         return landmark ? isLikelyOffscreenLandmark(landmark) : false;
       }).length
     : 0;
-  const leftSignal = getArmSignal(landmarks, "left");
-  const rightSignal = getArmSignal(landmarks, "right");
+  const leftSignal = getArmSignal(landmarks, "left", profile);
+  const rightSignal = getArmSignal(landmarks, "right", profile);
   const hasArmChain =
-    (leftSignal.complete && leftSignal.score >= 1.35) ||
-    (rightSignal.complete && rightSignal.score >= 1.35);
+    (leftSignal.complete && leftSignal.score >= profileGeometry.completeArmSignalScore) ||
+    (rightSignal.complete && rightSignal.score >= profileGeometry.completeArmSignalScore);
   const hasPartialArmWithAnchor =
     (leftSignal.partial || rightSignal.partial) &&
     visibleUpperBody >= 3 &&
@@ -1192,7 +1320,7 @@ function isUsablePoseFrame(
   if (edgeUpperBody >= 5) return false;
 
   return (
-    (hasTopViewSignal(landmarks) && reliableUpperBody >= 2) ||
+    (hasTopViewSignal(landmarks, profile) && reliableUpperBody >= 2) ||
     hasArmChain ||
     (hasShoulderPair && hasPartialArmWithAnchor)
   );
@@ -1286,9 +1414,11 @@ function reduceLandmarkVisibility(
 
 function cleanUnstableArmGeometry(
   landmarks: NormalizedLandmark[],
-  settings: TrackerSettings
+  settings: TrackerSettings,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): NormalizedLandmark[] {
   const cleaned = landmarks.map(cloneLandmark);
+  const profileGeometry = createProfileGeometry(profile);
 
   for (const side of ["left", "right"] as const) {
     const indices = armIndices(side);
@@ -1334,7 +1464,10 @@ function cleanUnstableArmGeometry(
       const forearm = landmarkDistance(elbow, wrist);
       const ratio = forearm / Math.max(upperArm, 0.001);
 
-      if (ratio < ARM_RATIO_MIN || ratio > ARM_RATIO_MAX) {
+      if (
+        ratio < profileGeometry.armRatioMin ||
+        ratio > profileGeometry.armRatioMax
+      ) {
         reduceLandmarkVisibility(cleaned, [indices.wrist, ...handIndices(side)]);
       }
     }
@@ -1345,9 +1478,10 @@ function cleanUnstableArmGeometry(
 
 function getArmChainStatus(
   landmarks: NormalizedLandmark[],
-  side: ArmSide
+  side: ArmSide,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): ArmChainStatus {
-  const signal = getArmSignal(landmarks, side);
+  const signal = getArmSignal(landmarks, side, profile);
   const indices = armIndices(side);
   const sideIndices = [indices.shoulder, indices.elbow, indices.wrist];
 
@@ -1369,7 +1503,8 @@ function createTrackingStatus(
   settings: TrackerSettings,
   state: TrackingState,
   predictionFrames: number,
-  fps: number
+  fps: number,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): TrackingStatus {
   const trackedIndices = Array.from(SWIM_LANDMARKS);
   const visibleLandmarks = trackedIndices.filter((index) =>
@@ -1382,8 +1517,8 @@ function createTrackingStatus(
     const landmark = landmarks[index];
     return landmark ? isLikelyOffscreenLandmark(landmark) : false;
   }).length;
-  const leftArm = getArmChainStatus(landmarks, "left");
-  const rightArm = getArmChainStatus(landmarks, "right");
+  const leftArm = getArmChainStatus(landmarks, "left", profile);
+  const rightArm = getArmChainStatus(landmarks, "right", profile);
   const bestArmScore = Math.max(leftArm.score, rightArm.score);
   const quality = clamp(
     visibleLandmarks / trackedIndices.length * 0.34 +
@@ -1592,7 +1727,11 @@ function presentPoints(points: Array<Point | null>): Point[] {
   return points.filter((point): point is Point => point !== null);
 }
 
-function hasTopViewSignal(landmarks: NormalizedLandmark[]): boolean {
+function hasTopViewSignal(
+  landmarks: NormalizedLandmark[],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): boolean {
+  const profileGeometry = createProfileGeometry(profile);
   const leftShoulder = visiblePoint(landmarks[11], LANDMARK_PARTIAL_VISIBILITY);
   const rightShoulder = visiblePoint(landmarks[12], LANDMARK_PARTIAL_VISIBILITY);
   const leftHip = visiblePoint(landmarks[23], LANDMARK_PARTIAL_VISIBILITY);
@@ -1620,9 +1759,9 @@ function hasTopViewSignal(landmarks: NormalizedLandmark[]): boolean {
       range(armPoints.map((point) => point.y))
     );
   const topByArmGeometry =
-    shoulderWidth >= SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD &&
+    shoulderWidth >= profileGeometry.sideViewShoulderThreshold &&
     armPoints.length >= 2 &&
-    armReach > Math.max(shoulderWidth * 0.65, 0.055) &&
+    armReach > Math.max(shoulderWidth * profileGeometry.topArmReachFactor, 0.055) &&
     armSpread > shoulderWidth * 0.45;
 
   if (!leftHip && !rightHip) {
@@ -1639,8 +1778,12 @@ function hasTopViewSignal(landmarks: NormalizedLandmark[]): boolean {
   return (torsoLength > 0.055 && torsoLength > bodyWidth * 0.55) || topByArmGeometry;
 }
 
-function hasSideViewSignal(landmarks: NormalizedLandmark[]): boolean {
-  if (hasTopViewSignal(landmarks)) return false;
+function hasSideViewSignal(
+  landmarks: NormalizedLandmark[],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): boolean {
+  const profileGeometry = createProfileGeometry(profile);
+  if (hasTopViewSignal(landmarks, profile)) return false;
 
   const leftShoulder = landmarks[11];
   const rightShoulder = landmarks[12];
@@ -1648,45 +1791,51 @@ function hasSideViewSignal(landmarks: NormalizedLandmark[]): boolean {
   const rightVisible = isVisible(rightShoulder, LANDMARK_PARTIAL_VISIBILITY);
 
   if (leftVisible !== rightVisible) {
-    const leftScore = armVisibilityScore(landmarks, "left");
-    const rightScore = armVisibilityScore(landmarks, "right");
+    const leftScore = armVisibilityScore(landmarks, "left", profile);
+    const rightScore = armVisibilityScore(landmarks, "right", profile);
     const strongerScore = Math.max(leftScore, rightScore);
     const weakerScore = Math.min(leftScore, rightScore);
 
     return (
-      strongerScore >= MIN_ARM_SIGNAL_SCORE + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
-      weakerScore < MIN_ARM_SIGNAL_SCORE * 0.65 &&
+      strongerScore >= profileGeometry.minArmSignalScore + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
+      weakerScore < profileGeometry.minArmSignalScore * 0.65 &&
       strongerScore - weakerScore > 1.2
     );
   }
 
   if (!leftVisible || !rightVisible) return false;
 
-  return distance(leftShoulder, rightShoulder) < SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD;
+  return distance(leftShoulder, rightShoulder) < profileGeometry.sideViewShoulderThreshold;
 }
 
-function shouldUseSingleArmMode(landmarks: NormalizedLandmark[]): boolean {
-  if (hasTopViewSignal(landmarks)) return false;
+function shouldUseSingleArmMode(
+  landmarks: NormalizedLandmark[],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): boolean {
+  const profileGeometry = createProfileGeometry(profile);
+  if (hasTopViewSignal(landmarks, profile)) return false;
 
-  const leftScore = armVisibilityScore(landmarks, "left");
-  const rightScore = armVisibilityScore(landmarks, "right");
+  const leftScore = armVisibilityScore(landmarks, "left", profile);
+  const rightScore = armVisibilityScore(landmarks, "right", profile);
   const strongerScore = Math.max(leftScore, rightScore);
   const weakerScore = Math.min(leftScore, rightScore);
   const oneArmClearlyDominant =
-    strongerScore >= MIN_ARM_SIGNAL_SCORE + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
-    weakerScore < MIN_ARM_SIGNAL_SCORE * 0.65 &&
+    strongerScore >= profileGeometry.minArmSignalScore + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
+    weakerScore < profileGeometry.minArmSignalScore * 0.65 &&
     strongerScore - weakerScore > 1.55;
 
-  return hasSideViewSignal(landmarks) || oneArmClearlyDominant;
+  return hasSideViewSignal(landmarks, profile) || oneArmClearlyDominant;
 }
 
 function resolveActiveArm(
   landmarks: NormalizedLandmark[],
-  memory: ActiveArmMemory
+  memory: ActiveArmMemory,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): ArmSide | null {
-  const leftScore = armVisibilityScore(landmarks, "left");
-  const rightScore = armVisibilityScore(landmarks, "right");
-  const candidate = pickPrimaryArm(landmarks);
+  const profileGeometry = createProfileGeometry(profile);
+  const leftScore = armVisibilityScore(landmarks, "left", profile);
+  const rightScore = armVisibilityScore(landmarks, "right", profile);
+  const candidate = pickPrimaryArm(landmarks, profile);
 
   if (!candidate) {
     memory.missingFrames += 1;
@@ -1727,10 +1876,10 @@ function resolveActiveArm(
 
   const activeScore = memory.side === "left" ? leftScore : rightScore;
   const candidateScore = candidate === "left" ? leftScore : rightScore;
-  const candidateSignal = getArmSignal(landmarks, candidate);
+  const candidateSignal = getArmSignal(landmarks, candidate, profile);
   const candidateClearlyBetter =
     candidateSignal.partial &&
-    candidateScore >= MIN_ARM_SIGNAL_SCORE + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
+    candidateScore >= profileGeometry.minArmSignalScore + SINGLE_SHOULDER_SIDE_SCORE_MARGIN &&
     candidateScore > activeScore + ACTIVE_ARM_SWITCH_SCORE_MARGIN;
 
   if (!candidateClearlyBetter) {
@@ -1789,8 +1938,10 @@ function emptyArmEVF(): ArmEVF {
 function getArmGeometryQuality(
   shoulder: NormalizedLandmark,
   elbow: NormalizedLandmark,
-  wrist: NormalizedLandmark
+  wrist: NormalizedLandmark,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): number {
+  const profileGeometry = createProfileGeometry(profile);
   if (
     !isTrackableLandmark(shoulder, LANDMARK_PARTIAL_VISIBILITY) ||
     !isTrackableLandmark(elbow, LANDMARK_PARTIAL_VISIBILITY) ||
@@ -1812,12 +1963,13 @@ function getArmGeometryQuality(
   }
 
   const ratio = forearm / Math.max(upperArm, 0.001);
-  if (ratio < ARM_RATIO_MIN || ratio > ARM_RATIO_MAX) return 0;
+  if (ratio < profileGeometry.armRatioMin || ratio > profileGeometry.armRatioMax) return 0;
 
   const visibilityQuality =
     (landmarkVisibility(shoulder) + landmarkVisibility(elbow) + landmarkVisibility(wrist)) / 3;
-  const ratioCenter = (ARM_RATIO_MIN + ARM_RATIO_MAX) / 2;
-  const ratioSpread = (ARM_RATIO_MAX - ARM_RATIO_MIN) / 2;
+  const ratioCenter = profileGeometry.expectedArmRatio;
+  const ratioSpread =
+    (profileGeometry.armRatioMax - profileGeometry.armRatioMin) / 2;
   const ratioQuality = 1 - Math.min(1, Math.abs(ratio - ratioCenter) / ratioSpread);
   const lengthQuality = Math.min(upperArm / 0.08, 1) * 0.45 + Math.min(forearm / 0.08, 1) * 0.55;
 
@@ -1935,7 +2087,8 @@ function checkEVFForArm(
   wrist: NormalizedLandmark | undefined,
   strokeRange: StrokeRange,
   axis: CatchAxis,
-  view: ShoulderMetrics["view"]
+  view: ShoulderMetrics["view"],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): ArmEVF {
   if (
     !shoulder ||
@@ -1948,7 +2101,7 @@ function checkEVFForArm(
     return emptyArmEVF();
   }
 
-  const confidence = getArmGeometryQuality(shoulder, elbow, wrist);
+  const confidence = getArmGeometryQuality(shoulder, elbow, wrist, profile);
   if (confidence < MIN_ANGLE_CONFIDENCE) {
     return emptyArmEVF();
   }
@@ -1993,7 +2146,7 @@ function stabilizeArmEVF(
           elbowAngle: heldTrack.elbowAngle,
           verticality: heldTrack.verticality,
           isEVF: false,
-          valid: false,
+          valid: heldTrack.confidence >= MIN_ANGLE_CONFIDENCE * 0.6,
           confidence: heldTrack.confidence,
         },
         track: heldTrack,
@@ -2066,7 +2219,8 @@ function checkEVF(
   landmarks: NormalizedLandmark[],
   strokeRange: StrokeRange,
   shoulders: ShoulderMetrics,
-  motion: MotionSummary
+  motion: MotionSummary,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): EVFResult {
   return {
     left: checkEVFForArm(
@@ -2075,7 +2229,8 @@ function checkEVF(
       landmarks[15],
       strokeRange,
       selectCatchAxis(strokeRange, motion, "left", shoulders.view),
-      shoulders.view
+      shoulders.view,
+      profile
     ),
     right: checkEVFForArm(
       landmarks[12],
@@ -2083,12 +2238,17 @@ function checkEVF(
       landmarks[16],
       strokeRange,
       selectCatchAxis(strokeRange, motion, "right", shoulders.view),
-      shoulders.view
+      shoulders.view,
+      profile
     ),
   };
 }
 
-function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
+function getShoulderMetrics(
+  landmarks: NormalizedLandmark[],
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
+): ShoulderMetrics {
+  const profileGeometry = createProfileGeometry(profile);
   const leftShoulder = landmarks[11];
   const rightShoulder = landmarks[12];
   const leftVisible = isVisible(leftShoulder, LANDMARK_PARTIAL_VISIBILITY);
@@ -2097,7 +2257,7 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
   const rightHip = visiblePoint(landmarks[24], LANDMARK_PARTIAL_VISIBILITY);
   const hipCenter = averagePoints(presentPoints([leftHip, rightHip]));
   const hipWidth = leftHip && rightHip ? distance(leftHip, rightHip) : 0;
-  const primaryArm = pickPrimaryArm(landmarks);
+  const primaryArm = pickPrimaryArm(landmarks, profile);
 
   if (!leftVisible && !rightVisible) {
     if (hipCenter) {
@@ -2172,9 +2332,9 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
   const left: Point = { x: leftShoulder.x, y: leftShoulder.y };
   const right: Point = { x: rightShoulder.x, y: rightShoulder.y };
   const width = distance(left, right);
-  const view = hasTopViewSignal(landmarks)
+  const view = hasTopViewSignal(landmarks, profile)
     ? "top"
-    : width < SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD
+    : width < profileGeometry.sideViewShoulderThreshold
       ? "side"
       : "front";
 
@@ -2192,13 +2352,14 @@ function getShoulderMetrics(landmarks: NormalizedLandmark[]): ShoulderMetrics {
 function classifyStroke(
   landmarks: NormalizedLandmark[],
   shoulders: ShoulderMetrics,
-  motion: MotionSummary
+  motion: MotionSummary,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): Pick<TechniqueAnalysis, "stroke" | "confidence"> {
   const leftWrist = landmarks[15];
   const rightWrist = landmarks[16];
   const leftElbow = landmarks[13];
   const rightElbow = landmarks[14];
-  const primaryArm = pickPrimaryArm(landmarks);
+  const primaryArm = pickPrimaryArm(landmarks, profile);
 
   if (!shoulders.visible) {
     return { stroke: "Unknown", confidence: 0 };
@@ -2218,8 +2379,8 @@ function classifyStroke(
     isVisible(rightElbow, LANDMARK_PARTIAL_VISIBILITY);
 
   if (shoulders.view === "top") {
-    const leftSignal = getArmSignal(landmarks, "left");
-    const rightSignal = getArmSignal(landmarks, "right");
+    const leftSignal = getArmSignal(landmarks, "left", profile);
+    const rightSignal = getArmSignal(landmarks, "right", profile);
     const visibleArmCount = [leftSignal.partial, rightSignal.partial].filter(Boolean).length;
     const hasStrokeMotion =
       motion.left.samples + motion.right.samples >= 8 &&
@@ -2259,7 +2420,7 @@ function classifyStroke(
 
   if (shoulders.view === "side" || !bothArmsVisible) {
     const primaryMotion = motion[primaryArm];
-    const completeChain = armHasCompleteChain(landmarks, primaryArm);
+    const completeChain = armHasCompleteChain(landmarks, primaryArm, profile);
     const hasStrokeMotion =
       primaryMotion.samples >= 8 &&
       (primaryMotion.rangeX > 0.055 || primaryMotion.rangeY > 0.055);
@@ -2308,13 +2469,14 @@ function buildTechniqueFeedback(
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
   shoulders: ShoulderMetrics,
-  stroke: StrokeType
+  stroke: StrokeType,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): TechniqueFeedback[] {
   const feedback: TechniqueFeedback[] = [];
   const leftWrist = landmarks[15];
   const rightWrist = landmarks[16];
-  const primaryArm = pickPrimaryArm(landmarks);
-  const primarySignal = primaryArm ? getArmSignal(landmarks, primaryArm) : null;
+  const primaryArm = pickPrimaryArm(landmarks, profile);
+  const primarySignal = primaryArm ? getArmSignal(landmarks, primaryArm, profile) : null;
 
   if (!shoulders.visible) {
     feedback.push({
@@ -2427,7 +2589,8 @@ function createTechniqueAnalysisFromStyle(
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
   shoulders: ShoulderMetrics,
-  style: StyleResult
+  style: StyleResult,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): TechniqueAnalysis {
   return {
     stroke: style.stroke,
@@ -2435,7 +2598,7 @@ function createTechniqueAnalysisFromStyle(
     confidence: style.confidence,
     lockState: "acquiring",
     shoulders,
-    feedback: buildTechniqueFeedback(landmarks, evf, shoulders, style.stroke),
+    feedback: buildTechniqueFeedback(landmarks, evf, shoulders, style.stroke, profile),
   };
 }
 
@@ -2473,7 +2636,8 @@ function refreshTechniqueFrame(
   technique: TechniqueAnalysis,
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
-  shoulders: ShoulderMetrics
+  shoulders: ShoulderMetrics,
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): TechniqueAnalysis {
   const refreshed = {
     ...technique,
@@ -2484,7 +2648,7 @@ function refreshTechniqueFrame(
     ...refreshed,
     feedback: withStyleMemoryFeedback(
       refreshed,
-      buildTechniqueFeedback(landmarks, evf, shoulders, technique.rawStroke)
+      buildTechniqueFeedback(landmarks, evf, shoulders, technique.rawStroke, profile)
     ),
   };
 }
@@ -2492,12 +2656,14 @@ function refreshTechniqueFrame(
 function createPendingTechnique(
   landmarks: NormalizedLandmark[],
   evf: EVFResult,
-  shoulders: ShoulderMetrics
+  shoulders: ShoulderMetrics,
+  provisionalStyle: StyleResult = { stroke: "Unknown", confidence: 0 },
+  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): TechniqueAnalysis {
   const pending: TechniqueAnalysis = {
-    stroke: "Unknown",
-    rawStroke: "Unknown",
-    confidence: 0,
+    stroke: provisionalStyle.stroke,
+    rawStroke: provisionalStyle.stroke,
+    confidence: provisionalStyle.confidence * 0.72,
     lockState: "acquiring",
     shoulders,
     feedback: [],
@@ -2507,7 +2673,13 @@ function createPendingTechnique(
     ...pending,
     feedback: withStyleMemoryFeedback(
       pending,
-      buildTechniqueFeedback(landmarks, evf, shoulders, "Unknown")
+      buildTechniqueFeedback(
+        landmarks,
+        evf,
+        shoulders,
+        provisionalStyle.stroke,
+        profile
+      )
     ),
   };
 }
@@ -2608,6 +2780,35 @@ function withStrokeMemory(
       { lockState, rawStroke, stroke },
       analysis.feedback
     ),
+  };
+}
+
+function applyStrokeFocus(
+  analysis: TechniqueAnalysis,
+  strokeFocus: StrokeFocus
+): TechniqueAnalysis {
+  if (strokeFocus === "Auto") return analysis;
+
+  const focusMatches =
+    analysis.rawStroke === strokeFocus || analysis.stroke === strokeFocus;
+  const focusFeedback: TechniqueFeedback = {
+    id: "style-focus",
+    severity: focusMatches ? "good" : "warning",
+    message: focusMatches
+      ? `${strokeFocus} focus is aligned with the detected stroke.`
+      : `${strokeFocus} focus is active; auto-detect is seeing ${analysis.rawStroke}.`,
+  };
+
+  return {
+    ...analysis,
+    stroke: strokeFocus,
+    confidence: focusMatches
+      ? Math.max(analysis.confidence, 0.58)
+      : Math.max(0.38, analysis.confidence * 0.72),
+    feedback: [
+      focusFeedback,
+      ...analysis.feedback.filter((item) => item.id !== focusFeedback.id),
+    ].slice(0, 6),
   };
 }
 
@@ -2767,6 +2968,92 @@ function formatSeconds(ms: number): string {
   return seconds >= 10 || Number.isInteger(seconds)
     ? `${seconds.toFixed(0)}s`
     : `${seconds.toFixed(1)}s`;
+}
+
+function formatClock(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, "0")}:${seconds
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function getInterfaceStyleOption(style: InterfaceStyle): InterfaceStyleOption {
+  return (
+    INTERFACE_STYLE_OPTIONS.find((option) => option.id === style) ??
+    INTERFACE_STYLE_OPTIONS[0]
+  );
+}
+
+function getPrimaryCue(
+  analysis: FullAnalysis | null,
+  strokeFocus: StrokeFocus
+): string {
+  if (!analysis) {
+    return strokeFocus === "Auto"
+      ? "Bring your upper body into frame to start live cues."
+      : `Bring your upper body into frame to coach ${strokeFocus}.`;
+  }
+
+  const { technique, evf, tracking } = analysis;
+  const criticalCue = technique.feedback.find(
+    (item) => item.severity === "critical"
+  );
+  const warningCue = technique.feedback.find(
+    (item) => item.severity === "warning"
+  );
+
+  if (criticalCue) return criticalCue.message;
+
+  if (
+    strokeFocus !== "Auto" &&
+    technique.rawStroke !== "Unknown" &&
+    technique.rawStroke !== strokeFocus
+  ) {
+    return `Focus is set to ${strokeFocus}; auto-detect currently sees ${technique.rawStroke}.`;
+  }
+
+  if (tracking.quality < 0.45) {
+    return "Improve lighting or keep one shoulder-elbow-wrist chain visible.";
+  }
+
+  if (evf.left.isEVF || evf.right.isEVF) {
+    return "EVF is active; keep the elbow high as the forearm tips down.";
+  }
+
+  if (warningCue) return warningCue.message;
+
+  return "Tracking is stable; hold a clean line through entry and catch.";
+}
+
+function createSessionSummary(
+  marks: SessionMark[],
+  lapCount: number,
+  elapsedMs: number,
+  strokeFocus: StrokeFocus
+): string {
+  const lines = [
+    "GlideAI session",
+    `Duration: ${formatClock(elapsedMs)}`,
+    `Laps: ${lapCount}`,
+    `Focus: ${strokeFocus}`,
+  ];
+
+  if (marks.length === 0) {
+    return [...lines, "Marks: none"].join("\n");
+  }
+
+  return [
+    ...lines,
+    "Marks:",
+    ...marks.map(
+      (mark) =>
+        `${mark.timeLabel} - ${mark.stroke} - quality ${mark.quality}% - EVF ${Math.round(
+          mark.evfConfidence * 100
+        )}% - ${mark.cue}`
+    ),
+  ].join("\n");
 }
 
 function statusDotClass(active: boolean) {
@@ -2936,7 +3223,7 @@ function ArmChainRow({
         <div className="ml-auto h-1.5 w-20 overflow-hidden rounded-full bg-zinc-800">
           <div
             className="h-full rounded-full bg-cyan-400"
-            style={{ width: `${clamp(score / 2.1, 0, 100)}%` }}
+            style={{ width: `${clamp(score, 0, 100)}%` }}
           />
         </div>
       </div>
@@ -2951,6 +3238,14 @@ function MetricsPanel({
   trackerSettings,
   onTrackerSettingsChange,
   onResetTracking,
+  analysisPaused,
+  onAnalysisPausedChange,
+  strokeFocus,
+  onStrokeFocusChange,
+  swimmerProfile,
+  onSwimmerProfileChange,
+  interfaceStyle,
+  onInterfaceStyleChange,
 }: {
   analysis: FullAnalysis | null;
   styleCheckIntervalMs: number;
@@ -2958,7 +3253,23 @@ function MetricsPanel({
   trackerSettings: TrackerSettings;
   onTrackerSettingsChange: (patch: Partial<TrackerSettings>) => void;
   onResetTracking: () => void;
+  analysisPaused: boolean;
+  onAnalysisPausedChange: (paused: boolean) => void;
+  strokeFocus: StrokeFocus;
+  onStrokeFocusChange: (focus: StrokeFocus) => void;
+  swimmerProfile: SwimmerProfile;
+  onSwimmerProfileChange: (patch: Partial<SwimmerProfile>) => void;
+  interfaceStyle: InterfaceStyle;
+  onInterfaceStyleChange: (style: InterfaceStyle) => void;
 }) {
+  const [panelView, setPanelView] = useState<PanelView>("dashboard");
+  const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
+  const [sessionRunning, setSessionRunning] = useState(true);
+  const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now());
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [lapCount, setLapCount] = useState(0);
+  const [sessionMarks, setSessionMarks] = useState<SessionMark[]>([]);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const evf = analysis?.evf ?? null;
   const technique = analysis?.technique ?? null;
   const styleCheck = analysis?.styleCheck ?? null;
@@ -2966,10 +3277,15 @@ function MetricsPanel({
   const tracking = analysis?.tracking ?? null;
   const arm = evf ? pickDisplayArm(evf) : null;
   const anyEVF = evf ? evf.left.isEVF || evf.right.isEVF : false;
+  const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
+  const profileGeometry = createProfileGeometry(swimmerProfile);
+  const coachCue = getPrimaryCue(analysis, strokeFocus);
   const topViewActive = technique?.shoulders.view === "top";
   const partialSubmersionActive = Boolean(
     technique?.feedback.some((item) => item.id === "partial-submerged")
   );
+  const warningCount =
+    technique?.feedback.filter((item) => item.severity !== "good").length ?? 0;
   const lastCheckLabel =
     styleCheck?.lastCheckedMsAgo === null || styleCheck?.lastCheckedMsAgo === undefined
       ? "Waiting"
@@ -3008,9 +3324,491 @@ function MetricsPanel({
           ? "Live"
           : "Lost"
     : "Waiting";
+  const bestSessionEvf = Math.max(
+    arm?.confidence ?? 0,
+    ...sessionMarks.map((mark) => mark.evfConfidence)
+  );
+  const averageMarkedQuality =
+    sessionMarks.length > 0
+      ? Math.round(
+          sessionMarks.reduce((total, mark) => total + mark.quality, 0) /
+            sessionMarks.length
+        )
+      : qualityPercent;
+  const drillSteps = [
+    strokeFocus === "Auto"
+      ? `Auto focus: ${technique?.stroke ?? "Scanning"}`
+      : `${strokeFocus} focus`,
+    anyEVF
+      ? "EVF hold: keep the elbow high through pressure."
+      : "Catch set: tip fingertips down before the pull.",
+    tracking && tracking.quality < 0.55
+      ? "Camera set: keep one full arm chain visible."
+      : "Line set: keep entry wide from the shoulder.",
+  ];
+
+  useEffect(() => {
+    if (!sessionRunning) return;
+
+    const updateElapsed = () => {
+      setElapsedMs(Date.now() - sessionStartedAt);
+    };
+
+    updateElapsed();
+    const timerId = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timerId);
+  }, [sessionRunning, sessionStartedAt]);
+
+  const toggleSessionRunning = () => {
+    if (sessionRunning) {
+      setElapsedMs(Date.now() - sessionStartedAt);
+      setSessionRunning(false);
+      return;
+    }
+
+    setSessionStartedAt(Date.now() - elapsedMs);
+    setSessionRunning(true);
+  };
+
+  const addSessionMark = () => {
+    if (!analysis) return;
+
+    const nextMark: SessionMark = {
+      id: Date.now(),
+      timeLabel: formatClock(elapsedMs),
+      stroke: analysis.technique.stroke,
+      quality: qualityPercent,
+      evfConfidence: arm?.confidence ?? 0,
+      cue: coachCue,
+    };
+
+    setSessionMarks((marks) => [nextMark, ...marks].slice(0, 8));
+  };
+
+  const resetSession = () => {
+    setSessionStartedAt(Date.now());
+    setElapsedMs(0);
+    setLapCount(0);
+    setSessionMarks([]);
+    setCopyStatus(null);
+    setSessionRunning(true);
+  };
+
+  const copySessionLog = () => {
+    const summary = createSessionSummary(
+      sessionMarks,
+      lapCount,
+      elapsedMs,
+      strokeFocus
+    );
+
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      setCopyStatus("Clipboard unavailable");
+      return;
+    }
+
+    void navigator.clipboard
+      .writeText(summary)
+      .then(() => setCopyStatus("Copied"))
+      .catch(() => setCopyStatus("Copy blocked"));
+  };
+
+  const themedButtonClass = (active: boolean) =>
+    active
+      ? selectedInterfaceStyle.activeClass
+      : "border-zinc-800 bg-zinc-900/70 text-zinc-400 hover:border-zinc-700 hover:text-zinc-100";
+  const handleProfileNumberChange = (
+    key: keyof SwimmerProfile,
+    value: number,
+    min: number,
+    max: number
+  ) => {
+    onSwimmerProfileChange({
+      [key]: clamp(Number.isFinite(value) ? value : min, min, max),
+    } as Partial<SwimmerProfile>);
+  };
 
   return (
     <div className="flex w-full flex-col gap-4 pr-1 xl:max-h-[calc(100vh-7.5rem)] xl:w-[22rem] xl:shrink-0 xl:overflow-y-auto">
+      <div className={metricCardClass("zinc")}>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Menu className="h-4 w-4 text-cyan-400" />
+            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+              Coach Menu
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onAnalysisPausedChange(!analysisPaused)}
+              className={`rounded-md border p-2 transition ${themedButtonClass(
+                analysisPaused
+              )}`}
+              title={analysisPaused ? "Resume analysis" : "Pause analysis"}
+            >
+              {analysisPaused ? (
+                <Play className="h-3.5 w-3.5" />
+              ) : (
+                <Pause className="h-3.5 w-3.5" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsPanelCollapsed((collapsed) => !collapsed)}
+              className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-300 transition hover:border-cyan-900 hover:text-cyan-100"
+              title={isPanelCollapsed ? "Open panel" : "Compact panel"}
+            >
+              {isPanelCollapsed ? (
+                <PanelRightOpen className="h-3.5 w-3.5" />
+              ) : (
+                <PanelRightClose className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+        </div>
+        {!isPanelCollapsed && (
+          <div className="grid grid-cols-4 gap-2 text-xs">
+            {(["dashboard", "coach", "settings", "history"] as const).map((view) => (
+              <button
+                key={view}
+                type="button"
+                onClick={() => setPanelView(view)}
+                className={`rounded-md border px-2 py-2 font-semibold capitalize transition ${themedButtonClass(
+                  panelView === view
+                )}`}
+              >
+                {view}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {!isPanelCollapsed && (
+        <>
+          {panelView === "dashboard" && (
+            <div className={metricCardClass(sessionRunning ? "emerald" : "zinc")}>
+              <div className="mb-3 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Timer className="h-4 w-4 text-emerald-400" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Session
+                  </span>
+                </div>
+                <span className="font-mono text-xs text-emerald-300">
+                  {formatClock(elapsedMs)}
+                </span>
+              </div>
+              <div className="grid grid-cols-3 divide-x divide-zinc-800/80 text-center">
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Laps</p>
+                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">{lapCount}</p>
+                </div>
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Best EVF</p>
+                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
+                    {Math.round(bestSessionEvf * 100)}%
+                  </p>
+                </div>
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Marks</p>
+                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
+                    {sessionMarks.length}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 grid grid-cols-4 gap-2">
+                <button
+                  type="button"
+                  onClick={toggleSessionRunning}
+                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-emerald-900 hover:text-emerald-100"
+                  title={sessionRunning ? "Pause session timer" : "Resume session timer"}
+                >
+                  {sessionRunning ? (
+                    <Pause className="mx-auto h-4 w-4" />
+                  ) : (
+                    <Play className="mx-auto h-4 w-4" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLapCount((count) => Math.max(0, count - 1))}
+                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-zinc-700"
+                  title="Remove lap"
+                >
+                  <Minus className="mx-auto h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLapCount((count) => count + 1)}
+                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-zinc-700"
+                  title="Add lap"
+                >
+                  <Plus className="mx-auto h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={addSessionMark}
+                  disabled={!analysis}
+                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-cyan-900 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Mark current cue"
+                >
+                  <BookmarkPlus className="mx-auto h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {panelView === "coach" && (
+            <>
+              <div className={metricCardClass(anyEVF ? "emerald" : "amber")}>
+                <div className="mb-3 flex items-center gap-2">
+                  <Trophy className="h-4 w-4 text-amber-300" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Live Cue
+                  </span>
+                </div>
+                <p className="text-sm font-semibold leading-relaxed text-zinc-100">
+                  {coachCue}
+                </p>
+                <div className="mt-3 flex flex-col gap-2">
+                  {drillSteps.map((step) => (
+                    <p
+                      key={step}
+                      className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-300"
+                    >
+                      {step}
+                    </p>
+                  ))}
+                </div>
+              </div>
+
+              <div className={metricCardClass(strokeFocus === "Auto" ? "zinc" : "cyan")}>
+                <div className="mb-3 flex items-center gap-2">
+                  <Target className="h-4 w-4 text-cyan-400" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Stroke Focus
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  {STROKE_FOCUS_OPTIONS.map((style) => (
+                    <button
+                      key={style}
+                      type="button"
+                      onClick={() => onStrokeFocusChange(style)}
+                      className={`rounded-md border px-3 py-2 text-left font-semibold transition ${themedButtonClass(
+                        strokeFocus === style
+                      )}`}
+                    >
+                      {style}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {panelView === "settings" && (
+            <>
+              <div className={metricCardClass("zinc")}>
+                <div className="mb-3 flex items-center gap-2">
+                  <Palette className="h-4 w-4 text-cyan-400" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Interface Style
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  {INTERFACE_STYLE_OPTIONS.map((style) => (
+                    <button
+                      key={style.id}
+                      type="button"
+                      onClick={() => onInterfaceStyleChange(style.id)}
+                      className={`rounded-md border px-2 py-2 font-semibold transition ${themedButtonClass(
+                        interfaceStyle === style.id
+                      )}`}
+                      title={style.description}
+                    >
+                      {style.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className={metricCardClass("cyan")}>
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Hand className="h-4 w-4 text-cyan-400" />
+                    <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                      Swimmer Profile
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSwimmerProfileChange(DEFAULT_SWIMMER_PROFILE);
+                      onResetTracking();
+                    }}
+                    className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-cyan-900 hover:text-cyan-100"
+                  >
+                    Reset
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    ["heightIn", "Height", swimmerProfile.heightIn, 48, 86, "in"],
+                    ["weightLb", "Weight", swimmerProfile.weightLb, 70, 330, "lb"],
+                    ["armSpanIn", "Arm span", swimmerProfile.armSpanIn, 46, 92, "in"],
+                    ["shoulderWidthIn", "Shoulders", swimmerProfile.shoulderWidthIn, 11, 26, "in"],
+                    ["upperArmIn", "Upper arm", swimmerProfile.upperArmIn, 7, 20, "in"],
+                    ["forearmIn", "Forearm", swimmerProfile.forearmIn, 7, 19, "in"],
+                  ].map(([key, label, value, min, max, unit]) => (
+                    <label key={key} className="block">
+                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                        {label}
+                      </span>
+                      <div className="flex overflow-hidden rounded-md border border-zinc-800 bg-zinc-900/70 focus-within:border-cyan-700">
+                        <input
+                          type="number"
+                          min={min}
+                          max={max}
+                          step={key === "weightLb" ? 1 : 0.5}
+                          value={value}
+                          onChange={(event) =>
+                            handleProfileNumberChange(
+                              key as keyof SwimmerProfile,
+                              Number(event.currentTarget.value),
+                              Number(min),
+                              Number(max)
+                            )
+                          }
+                          className="min-w-0 flex-1 bg-transparent px-2 py-2 text-sm font-semibold text-zinc-100 outline-none"
+                        />
+                        <span className="flex w-8 items-center justify-center border-l border-zinc-800 text-[10px] uppercase text-zinc-500">
+                          {unit}
+                        </span>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-4">
+                  <div className="mb-2 flex items-center justify-between text-[11px] text-zinc-500">
+                    <span>Profile fit</span>
+                    <span>{swimmerProfile.profileInfluence}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={swimmerProfile.profileInfluence}
+                    onChange={(event) =>
+                      handleProfileNumberChange(
+                        "profileInfluence",
+                        Number(event.currentTarget.value),
+                        0,
+                        100
+                      )
+                    }
+                    className="w-full accent-cyan-400"
+                    aria-label="Swimmer profile influence"
+                  />
+                </div>
+                <div className="mt-3 grid grid-cols-3 divide-x divide-zinc-800/80 text-center">
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Ratio</p>
+                    <p className="mt-1 font-mono text-xs text-zinc-100">
+                      {profileGeometry.expectedArmRatio.toFixed(2)}
+                    </p>
+                  </div>
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Gate</p>
+                    <p className="mt-1 font-mono text-xs text-zinc-100">
+                      {profileGeometry.armRatioMin.toFixed(2)}-{profileGeometry.armRatioMax.toFixed(2)}
+                    </p>
+                  </div>
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Signal</p>
+                    <p className="mt-1 font-mono text-xs text-zinc-100">
+                      {profileGeometry.minArmSignalScore.toFixed(2)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {panelView === "history" && (
+            <div className={metricCardClass("zinc")}>
+              <div className="mb-3 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <ClipboardList className="h-4 w-4 text-cyan-400" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Session Log
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={copySessionLog}
+                  className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-cyan-900 hover:text-cyan-100"
+                >
+                  {copyStatus ?? "Copy"}
+                </button>
+              </div>
+              <div className="grid grid-cols-3 divide-x divide-zinc-800/80 text-center">
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Avg</p>
+                  <p className="mt-1 font-mono text-sm text-zinc-100">
+                    {averageMarkedQuality}%
+                  </p>
+                </div>
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Issues</p>
+                  <p className="mt-1 font-mono text-sm text-zinc-100">{warningCount}</p>
+                </div>
+                <div className="px-2">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Focus</p>
+                  <p className="mt-1 truncate text-xs font-semibold text-zinc-100">
+                    {strokeFocus}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-col gap-2">
+                {sessionMarks.length > 0 ? (
+                  sessionMarks.map((mark) => (
+                    <div
+                      key={mark.id}
+                      className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-xs text-cyan-300">
+                          {mark.timeLabel}
+                        </span>
+                        <span className="text-xs font-semibold text-zinc-200">
+                          {mark.stroke}
+                        </span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-xs text-zinc-500">
+                        {mark.cue}
+                      </p>
+                    </div>
+                  ))
+                ) : (
+                  <p className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-400">
+                    No marked cues yet.
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={resetSession}
+                className="mt-3 w-full rounded-md border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-xs font-semibold text-zinc-300 transition hover:border-amber-900 hover:text-amber-100"
+              >
+                Reset session
+              </button>
+            </div>
+          )}
+
       <div className={metricCardClass("cyan")}>
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -3166,6 +3964,29 @@ function MetricsPanel({
             )}`}
           >
             Trail
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              onTrackerSettingsChange({ showCoachCues: !trackerSettings.showCoachCues })
+            }
+            className={`rounded-md border px-2 py-2 transition ${controlButtonClass(
+              trackerSettings.showCoachCues
+            )}`}
+          >
+            Cues
+          </button>
+          <button
+            type="button"
+            onClick={() => onTrackerSettingsChange({ mirrored: !trackerSettings.mirrored })}
+            className={`rounded-md border px-2 py-2 transition ${controlButtonClass(
+              trackerSettings.mirrored
+            )}`}
+          >
+            <span className="flex items-center justify-center gap-1.5">
+              <SwitchCamera className="h-3.5 w-3.5" />
+              Mirror
+            </span>
           </button>
         </div>
         <input
@@ -3363,6 +4184,8 @@ function MetricsPanel({
           </p>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }
@@ -3437,6 +4260,9 @@ export default function AnalysisEngine() {
   const lastStateUpdateRef = useRef(0);
   const missingFramesRef = useRef(0);
   const trackerSettingsRef = useRef<TrackerSettings>(DEFAULT_TRACKER_SETTINGS);
+  const analysisPausedRef = useRef(false);
+  const strokeFocusRef = useRef<StrokeFocus>("Auto");
+  const swimmerProfileRef = useRef<SwimmerProfile>(DEFAULT_SWIMMER_PROFILE);
   const lastFrameTimestampRef = useRef(0);
   const fpsRef = useRef(0);
 
@@ -3447,9 +4273,16 @@ export default function AnalysisEngine() {
   const [trackerSettings, setTrackerSettings] = useState<TrackerSettings>(
     DEFAULT_TRACKER_SETTINGS
   );
+  const [analysisPaused, setAnalysisPaused] = useState(false);
+  const [strokeFocus, setStrokeFocus] = useState<StrokeFocus>("Auto");
+  const [swimmerProfile, setSwimmerProfile] = useState<SwimmerProfile>(
+    DEFAULT_SWIMMER_PROFILE
+  );
+  const [interfaceStyle, setInterfaceStyle] = useState<InterfaceStyle>("pro");
   const [cameraReady, setCameraReady] = useState(false);
   const [videoStreamReady, setVideoStreamReady] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   const resetTrackingMemory = useCallback(() => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
@@ -3495,6 +4328,22 @@ export default function AnalysisEngine() {
     setStyleCheckIntervalMs(normalizedInterval);
   }, []);
 
+  const handleAnalysisPausedChange = useCallback((paused: boolean) => {
+    analysisPausedRef.current = paused;
+    setAnalysisPaused(paused);
+  }, []);
+
+  const handleStrokeFocusChange = useCallback((focus: StrokeFocus) => {
+    strokeFocusRef.current = focus;
+    setStrokeFocus(focus);
+  }, []);
+
+  const handleSwimmerProfileChange = useCallback((patch: Partial<SwimmerProfile>) => {
+    const nextProfile = { ...swimmerProfileRef.current, ...patch };
+    swimmerProfileRef.current = nextProfile;
+    setSwimmerProfile(nextProfile);
+  }, []);
+
   const onResults = useCallback((results: Results) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -3502,9 +4351,20 @@ export default function AnalysisEngine() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const video = webcamRef.current?.video ?? undefined;
-    const overlayMetrics = prepareOverlayCanvas(canvas, ctx, video);
     const settings = trackerSettingsRef.current;
+    const swimmerProfile = swimmerProfileRef.current;
+    const video = webcamRef.current?.video ?? undefined;
+    const overlayMetrics = prepareOverlayCanvas(
+      canvas,
+      ctx,
+      video,
+      settings.mirrored
+    );
+
+    if (analysisPausedRef.current) {
+      return;
+    }
+
     const now = performance.now();
     const frameDelta = lastFrameTimestampRef.current
       ? now - lastFrameTimestampRef.current
@@ -3519,8 +4379,16 @@ export default function AnalysisEngine() {
     }
 
     const maxPredictionFrames = predictionHoldFrames(settings.predictionMode);
+    const rawLandmarks = results.poseLandmarks ?? null;
+    const roughLandmarks = rawLandmarks
+      ? cleanUnstableArmGeometry(
+          enhanceSwimLandmarks(rawLandmarks),
+          settings,
+          swimmerProfile
+        )
+      : null;
 
-    if (!results.poseLandmarks || !isUsablePoseFrame(results.poseLandmarks, settings)) {
+    if (!roughLandmarks || !isUsablePoseFrame(roughLandmarks, settings, swimmerProfile)) {
       missingFramesRef.current += 1;
       const predictedLandmarks =
         maxPredictionFrames > 0
@@ -3542,7 +4410,8 @@ export default function AnalysisEngine() {
             settings,
             "predicting",
             missingFramesRef.current,
-            fpsRef.current
+            fpsRef.current,
+            swimmerProfile
           ),
         };
 
@@ -3569,18 +4438,24 @@ export default function AnalysisEngine() {
       return;
     }
 
+    if (!rawLandmarks) return;
     missingFramesRef.current = 0;
 
     const smoothed = enhanceSwimLandmarks(
-      stabilizeLandmarks(results.poseLandmarks, landmarkMemoryRef.current, settings)
+      stabilizeLandmarks(rawLandmarks, landmarkMemoryRef.current, settings)
     );
-    const cleaned = cleanUnstableArmGeometry(smoothed, settings);
+    const cleaned = cleanUnstableArmGeometry(smoothed, settings, swimmerProfile);
     syncEnhancedArmEndpointMemory(landmarkMemoryRef.current, cleaned);
     const armIdentity = resolveArmIdentityLandmarks(
       cleaned,
-      armIdentityMemoryRef.current
+      armIdentityMemoryRef.current,
+      swimmerProfile
     );
-    const identified = cleanUnstableArmGeometry(armIdentity.landmarks, settings);
+    const identified = cleanUnstableArmGeometry(
+      armIdentity.landmarks,
+      settings,
+      swimmerProfile
+    );
 
     if (armIdentity.swappedChanged) {
       motionHistoryRef.current = createMotionHistory();
@@ -3589,23 +4464,23 @@ export default function AnalysisEngine() {
       styleWindowStartedAtRef.current = now;
     }
 
-    const singleArmMode = shouldUseSingleArmMode(identified);
+    const singleArmMode = shouldUseSingleArmMode(identified, swimmerProfile);
     if (!singleArmMode) {
       activeArmMemoryRef.current = createActiveArmMemory();
     }
 
     const activeArm = singleArmMode
-      ? resolveActiveArm(identified, activeArmMemoryRef.current)
+      ? resolveActiveArm(identified, activeArmMemoryRef.current, swimmerProfile)
       : null;
     const lm = activeArm ? suppressArm(identified, oppositeArm(activeArm)) : identified;
 
     const motion = updateMotionHistory(motionHistoryRef.current, lm);
-    const shoulders = getShoulderMetrics(lm);
+    const shoulders = getShoulderMetrics(lm, swimmerProfile);
     const sr = strokeRangeRef.current;
     updateStrokeRange(sr, lm);
 
     const evf = stabilizeEVFResult(
-      checkEVF(lm, sr, shoulders, motion),
+      checkEVF(lm, sr, shoulders, motion, swimmerProfile),
       angleMemoryRef.current,
       shoulders.view
     );
@@ -3615,7 +4490,7 @@ export default function AnalysisEngine() {
       styleWindowStartedAtRef.current = now;
     }
 
-    const rawStyle = classifyStroke(lm, shoulders, motion);
+    const rawStyle = classifyStroke(lm, shoulders, motion, swimmerProfile);
     pushStyleSample(styleAccumulatorRef.current, rawStyle);
 
     const shouldCheckStyle =
@@ -3631,7 +4506,8 @@ export default function AnalysisEngine() {
         lm,
         evf,
         shoulders,
-        intervalStyle
+        intervalStyle,
+        swimmerProfile
       );
       technique = withStrokeMemory(rawTechnique, strokeMemoryRef.current);
       lastStyleTechniqueRef.current = technique;
@@ -3643,11 +4519,20 @@ export default function AnalysisEngine() {
         lastStyleTechniqueRef.current,
         lm,
         evf,
-        shoulders
+        shoulders,
+        swimmerProfile
       );
     } else {
-      technique = createPendingTechnique(lm, evf, shoulders);
+      technique = createPendingTechnique(
+        lm,
+        evf,
+        shoulders,
+        rawStyle,
+        swimmerProfile
+      );
     }
+
+    technique = applyStrokeFocus(technique, strokeFocusRef.current);
 
     const styleCheck = createStyleCheckStatus(
       now,
@@ -3661,7 +4546,14 @@ export default function AnalysisEngine() {
       technique,
       styleCheck,
       armIdentity: armIdentity.status,
-      tracking: createTrackingStatus(lm, settings, "live", 0, fpsRef.current),
+      tracking: createTrackingStatus(
+        lm,
+        settings,
+        "live",
+        0,
+        fpsRef.current,
+        swimmerProfile
+      ),
       trails: createMotionTrails(motionHistoryRef.current),
     };
     lastAnalysisRef.current = analysis;
@@ -3703,10 +4595,10 @@ export default function AnalysisEngine() {
 
         poseInstance.setOptions({
           modelComplexity: 1,
-          smoothLandmarks: false,
+          smoothLandmarks: true,
           enableSegmentation: false,
-          minDetectionConfidence: 0.55,
-          minTrackingConfidence: 0.6,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.55,
         });
 
         poseInstance.onResults(onResults);
@@ -3741,6 +4633,9 @@ export default function AnalysisEngine() {
       } catch (error) {
         if (!cancelled) {
           console.error("Pose engine failed to initialize", error);
+          setCameraError(
+            error instanceof Error ? error.message : "Pose engine failed to initialize"
+          );
           setCameraReady(false);
           setIsLoaded(false);
         }
@@ -3780,20 +4675,35 @@ export default function AnalysisEngine() {
     };
   }, [onResults, videoStreamReady]);
 
+  const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
+  const coachCue = getPrimaryCue(analysisState, strokeFocus);
+
   return (
-    <div className="flex min-h-[calc(100vh-9rem)] w-full flex-col gap-5 bg-transparent xl:flex-row xl:items-start">
-      <div className="relative min-h-[360px] w-full flex-1 overflow-hidden rounded-lg border border-zinc-800 bg-black shadow-2xl shadow-black/50 sm:min-h-[460px] xl:min-h-[calc(100vh-9rem)]">
+    <div
+      className={`glide-shell flex min-h-[calc(100vh-9rem)] w-full flex-col gap-5 rounded-lg p-1 ${selectedInterfaceStyle.shellClass} xl:flex-row xl:items-start`}
+    >
+      <div
+        className={`relative min-h-[360px] w-full flex-1 overflow-hidden rounded-lg border bg-black shadow-2xl sm:min-h-[460px] xl:min-h-[calc(100vh-9rem)] ${selectedInterfaceStyle.videoClass}`}
+      >
         <Webcam
           ref={webcamRef}
-          mirrored
+          mirrored={trackerSettings.mirrored}
           className="relative z-0 w-full h-full object-cover"
           videoConstraints={{
             width: { ideal: VIDEO_WIDTH },
             height: { ideal: VIDEO_HEIGHT },
             facingMode: "user",
           }}
-          onUserMedia={() => setVideoStreamReady(true)}
-          onUserMediaError={() => setVideoStreamReady(false)}
+          onUserMedia={() => {
+            setCameraError(null);
+            setVideoStreamReady(true);
+          }}
+          onUserMediaError={(error) => {
+            setVideoStreamReady(false);
+            setCameraError(
+              error instanceof Error ? error.message : "Camera is unavailable"
+            );
+          }}
         />
         <canvas
           ref={canvasRef}
@@ -3832,7 +4742,36 @@ export default function AnalysisEngine() {
             EVF {analysisState?.evf.left.isEVF || analysisState?.evf.right.isEVF ? "Active" : "Scan"}
           </span>
         </div>
-        {(!isLoaded || !cameraReady) && (
+
+        {trackerSettings.showCoachCues && !cameraError && (
+          <div
+            className={`pointer-events-none absolute bottom-4 left-4 right-4 z-[105] rounded-lg border px-4 py-3 text-sm font-semibold shadow-xl backdrop-blur-md ${selectedInterfaceStyle.cueClass}`}
+          >
+            {coachCue}
+          </div>
+        )}
+
+        {analysisPaused && !cameraError && (
+          <div className="pointer-events-none absolute inset-0 z-[108] flex items-center justify-center bg-black/35 backdrop-blur-[1px]">
+            <div className="rounded-lg border border-zinc-700 bg-black/70 px-4 py-3 text-sm font-semibold text-zinc-100 shadow-xl">
+              Analysis paused
+            </div>
+          </div>
+        )}
+
+        {cameraError ? (
+          <div className="absolute inset-0 z-[110] flex items-center justify-center bg-zinc-950/90 backdrop-blur-sm">
+            <div className="max-w-sm px-6 text-center">
+              <CameraOff className="mx-auto mb-3 h-8 w-8 text-amber-300" />
+              <p className="text-sm font-semibold text-zinc-100">
+                Camera or pose engine unavailable
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-zinc-500">
+                {cameraError}
+              </p>
+            </div>
+          </div>
+        ) : (!isLoaded || !cameraReady) && (
           <div className="absolute inset-0 z-[110] flex items-center justify-center bg-zinc-950/85 backdrop-blur-sm">
             <div className="text-center px-4">
               <div className="w-8 h-8 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
@@ -3849,6 +4788,14 @@ export default function AnalysisEngine() {
         trackerSettings={trackerSettings}
         onTrackerSettingsChange={handleTrackerSettingsChange}
         onResetTracking={resetTrackingMemory}
+        analysisPaused={analysisPaused}
+        onAnalysisPausedChange={handleAnalysisPausedChange}
+        strokeFocus={strokeFocus}
+        onStrokeFocusChange={handleStrokeFocusChange}
+        swimmerProfile={swimmerProfile}
+        onSwimmerProfileChange={handleSwimmerProfileChange}
+        interfaceStyle={interfaceStyle}
+        onInterfaceStyleChange={setInterfaceStyle}
       />
     </div>
   );
