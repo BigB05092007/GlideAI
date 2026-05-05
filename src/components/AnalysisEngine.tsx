@@ -733,6 +733,51 @@ function cameraViewBadgeLabel(mode: CameraViewMode, view: AnalysisView | null): 
   return `${analysisViewLabel(view)} View`;
 }
 
+function hasBrowserCameraApi(): boolean {
+  return Boolean(
+    typeof navigator !== "undefined" &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === "function"
+  );
+}
+
+function cameraUnsupportedMessage(): string {
+  if (typeof window !== "undefined" && !window.isSecureContext) {
+    return "Camera access needs a secure page. Open the app at http://localhost:3000 or http://127.0.0.1:3000, or use HTTPS if it is deployed or opened from another device.";
+  }
+
+  return "This browser does not expose camera access. Open the app in desktop Chrome or Microsoft Edge at http://localhost:3000 or http://127.0.0.1:3000, not inside an embedded preview.";
+}
+
+function cameraErrorMessage(error: unknown): string {
+  const fallback = "Camera is unavailable.";
+  const name = error instanceof DOMException ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error || fallback);
+  const normalized = `${name} ${message}`.toLowerCase();
+
+  if (
+    normalized.includes("getusermedia") ||
+    normalized.includes("not implemented") ||
+    normalized.includes("media devices")
+  ) {
+    return cameraUnsupportedMessage();
+  }
+
+  if (name === "NotAllowedError" || normalized.includes("permission")) {
+    return "Camera permission was blocked. Allow camera access in the browser address bar, then press Retry camera.";
+  }
+
+  if (name === "NotFoundError" || normalized.includes("requested device not found")) {
+    return "No camera was found. Plug in or enable a webcam, then press Retry camera.";
+  }
+
+  if (name === "NotReadableError" || normalized.includes("could not start")) {
+    return "The camera is already in use or Windows blocked it. Close other camera apps and check Windows Privacy > Camera.";
+  }
+
+  return message || fallback;
+}
+
 function isTopLikeView(view: AnalysisView): boolean {
   return view === "top" || view === "top-side";
 }
@@ -4436,6 +4481,8 @@ export default function AnalysisEngine() {
   const [videoStreamReady, setVideoStreamReady] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraRetryKey, setCameraRetryKey] = useState(0);
+  const [cameraApiSupported, setCameraApiSupported] = useState(true);
 
   const resetTrackingMemory = useCallback(() => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
@@ -4502,6 +4549,24 @@ export default function AnalysisEngine() {
     const nextProfile = { ...swimmerProfileRef.current, ...patch };
     swimmerProfileRef.current = nextProfile;
     setSwimmerProfile(nextProfile);
+  }, []);
+
+  const retryCamera = useCallback(() => {
+    const supported = hasBrowserCameraApi();
+    setCameraApiSupported(supported);
+    setCameraError(supported ? null : cameraUnsupportedMessage());
+    setCameraReady(false);
+    setVideoStreamReady(false);
+    setIsLoaded(false);
+    setCameraRetryKey((key) => key + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!hasBrowserCameraApi()) {
+      setCameraApiSupported(false);
+      setVideoStreamReady(false);
+      setCameraError(cameraUnsupportedMessage());
+    }
   }, []);
 
   const onResults = useCallback((results: Results) => {
@@ -4849,26 +4914,27 @@ export default function AnalysisEngine() {
       <div
         className={`relative min-h-[360px] w-full flex-1 overflow-hidden rounded-lg border bg-black shadow-2xl sm:min-h-[460px] xl:min-h-[calc(100vh-9rem)] ${selectedInterfaceStyle.videoClass}`}
       >
-        <Webcam
-          ref={webcamRef}
-          mirrored={trackerSettings.mirrored}
-          className="relative z-0 w-full h-full object-cover"
-          videoConstraints={{
-            width: { ideal: VIDEO_WIDTH },
-            height: { ideal: VIDEO_HEIGHT },
-            facingMode: "user",
-          }}
-          onUserMedia={() => {
-            setCameraError(null);
-            setVideoStreamReady(true);
-          }}
-          onUserMediaError={(error) => {
-            setVideoStreamReady(false);
-            setCameraError(
-              error instanceof Error ? error.message : "Camera is unavailable"
-            );
-          }}
-        />
+        {cameraApiSupported && (
+          <Webcam
+            key={cameraRetryKey}
+            ref={webcamRef}
+            mirrored={trackerSettings.mirrored}
+            className="relative z-0 w-full h-full object-cover"
+            videoConstraints={{
+              width: { ideal: VIDEO_WIDTH },
+              height: { ideal: VIDEO_HEIGHT },
+              facingMode: "user",
+            }}
+            onUserMedia={() => {
+              setCameraError(null);
+              setVideoStreamReady(true);
+            }}
+            onUserMediaError={(error) => {
+              setVideoStreamReady(false);
+              setCameraError(cameraErrorMessage(error));
+            }}
+          />
+        )}
         <canvas
           ref={canvasRef}
           className="absolute inset-0 w-full h-full pointer-events-none z-[100]"
@@ -4932,6 +4998,13 @@ export default function AnalysisEngine() {
               <p className="mt-2 text-xs leading-relaxed text-zinc-500">
                 {cameraError}
               </p>
+              <button
+                type="button"
+                onClick={retryCamera}
+                className="mt-4 rounded-md border border-amber-500/60 bg-amber-950/50 px-3 py-2 text-xs font-semibold text-amber-100 transition hover:border-amber-300"
+              >
+                Retry camera
+              </button>
             </div>
           </div>
         ) : (!isLoaded || !cameraReady) && (
