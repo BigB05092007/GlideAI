@@ -3,3 +3,4 @@ out/
 release/
 .next/
 public/vendor/
+ios/App/App/public/

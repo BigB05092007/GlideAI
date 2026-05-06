@@ -6,6 +6,7 @@
     "out/**",
     "dist/**",
     "public/vendor/**",
+    "ios/App/App/public/**",
     "node_modules/**"
   ]
 }

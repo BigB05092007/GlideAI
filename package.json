@@ -15,12 +15,17 @@
     "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix",
     "clean:artifacts": "node scripts/clean-local-artifacts.mjs",
     "calibrate:stroke": "node scripts/calibrate-stroke-model.mjs data/stroke-samples.json src/data/strokeCalibrationModel.json",
+    "ios:prepare": "npm run build:static && cap sync ios",
+    "ios:add": "cap add ios",
+    "ios:open": "cap open ios",
     "electron:dev": "concurrently -k \"cross-env BROWSER=none next dev\" \"wait-on http://127.0.0.1:3000 && cross-env ELECTRON_DEV=1 electron .\"",
     "build:electron": "cross-env ELECTRON_BUILD=1 next build",
     "electron:pack": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
     "electron:dir": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win dir"
   },
   "dependencies": {
+    "@capacitor/core": "^8.3.1",
+    "@capacitor/ios": "^8.3.1",
     "@mediapipe/camera_utils": "^0.3.1675466862",
     "@mediapipe/drawing_utils": "^0.3.1675466124",
     "@mediapipe/pose": "0.5.1675469404",
@@ -31,6 +36,7 @@
     "react-webcam": "^7.2.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.3.1",
     "@types/node": "^22.15.2",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
@@ -63,11 +69,15 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },

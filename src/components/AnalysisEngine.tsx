@@ -4881,6 +4881,7 @@ export default function AnalysisEngine() {
           <Webcam
             key={cameraRetryKey}
             ref={webcamRef}
+            audio={false}
             mirrored={trackerSettings.mirrored}
             className="relative z-0 w-full h-full object-cover"
             videoConstraints={{
