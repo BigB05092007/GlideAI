@@ -17,7 +17,6 @@ import {
   Hand,
   Eye,
   Menu,
-  Minus,
   Palette,
   PanelRightClose,
   PanelRightOpen,
@@ -309,7 +308,7 @@ interface InterfaceStyleOption {
   vars: CSSProperties;
 }
 
-interface SessionMark {
+export interface SessionMark {
   id: number;
   timeLabel: string;
   stroke: StrokeType;
@@ -3339,6 +3338,7 @@ function MetricsPanel({
   onSwimmerProfileChange,
   interfaceStyle,
   onInterfaceStyleChange,
+  onSessionComplete,
 }: {
   analysis: FullAnalysis | null;
   styleCheckIntervalMs: number;
@@ -3354,11 +3354,13 @@ function MetricsPanel({
   onSwimmerProfileChange: (patch: Partial<SwimmerProfile>) => void;
   interfaceStyle: InterfaceStyle;
   onInterfaceStyleChange: (style: InterfaceStyle) => void;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onSessionComplete?: (sessionData: any) => void;
 }) {
   const [panelView, setPanelView] = useState<PanelView>("dashboard");
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
-  const [sessionRunning, setSessionRunning] = useState(true);
-  const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now());
+  const [sessionState, setSessionState] = useState<"idle" | "running" | "paused">("idle");
+  const [sessionStartedAt, setSessionStartedAt] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [lapCount, setLapCount] = useState(0);
   const [sessionMarks, setSessionMarks] = useState<SessionMark[]>([]);
@@ -3415,7 +3417,8 @@ function MetricsPanel({
     : "Waiting";
   const bestSessionEvf = Math.max(
     arm?.confidence ?? 0,
-    ...sessionMarks.map((mark) => mark.evfConfidence)
+    ...sessionMarks.map((mark) => mark.evfConfidence),
+    0
   );
   const averageMarkedQuality =
     sessionMarks.length > 0
@@ -3437,30 +3440,46 @@ function MetricsPanel({
   ];
 
   useEffect(() => {
-    if (!sessionRunning) return;
+    if (sessionState !== "running") return;
 
-    const updateElapsed = () => {
+    const timerId = window.setInterval(() => {
       setElapsedMs(Date.now() - sessionStartedAt);
-    };
-
-    updateElapsed();
-    const timerId = window.setInterval(updateElapsed, 1000);
+    }, 1000);
     return () => window.clearInterval(timerId);
-  }, [sessionRunning, sessionStartedAt]);
+  }, [sessionState, sessionStartedAt]);
 
   const toggleSessionRunning = () => {
-    if (sessionRunning) {
-      setElapsedMs(Date.now() - sessionStartedAt);
-      setSessionRunning(false);
-      return;
+    if (sessionState === "idle") {
+      setSessionStartedAt(Date.now());
+      setSessionState("running");
+    } else if (sessionState === "running") {
+      setSessionState("paused");
+    } else {
+      setSessionStartedAt(Date.now() - elapsedMs);
+      setSessionState("running");
     }
+  };
 
-    setSessionStartedAt(Date.now() - elapsedMs);
-    setSessionRunning(true);
+  const handleStopSession = () => {
+    if (onSessionComplete) {
+      onSessionComplete({
+        id: Date.now(),
+        date: new Date().toISOString(),
+        durationMs: elapsedMs,
+        lapCount,
+        bestEvf: bestSessionEvf,
+        marks: sessionMarks,
+        strokeFocus,
+      });
+    }
+    setSessionState("idle");
+    setElapsedMs(0);
+    setLapCount(0);
+    setSessionMarks([]);
   };
 
   const addSessionMark = () => {
-    if (!analysis) return;
+    if (!analysis || sessionState !== "running") return;
 
     const nextMark: SessionMark = {
       id: Date.now(),
@@ -3480,7 +3499,7 @@ function MetricsPanel({
     setLapCount(0);
     setSessionMarks([]);
     setCopyStatus(null);
-    setSessionRunning(true);
+    setSessionState("idle");
   };
 
   const copySessionLog = () => {
@@ -3577,7 +3596,7 @@ function MetricsPanel({
       {!isPanelCollapsed && (
         <>
           {panelView === "dashboard" && (
-            <div className={metricCardClass(sessionRunning ? "emerald" : "zinc")}>
+            <div className={metricCardClass(sessionState === "running" ? "emerald" : "zinc")}>
               <div className="mb-3 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Timer className="h-4 w-4 text-emerald-400" />
@@ -3589,63 +3608,80 @@ function MetricsPanel({
                   {formatClock(elapsedMs)}
                 </span>
               </div>
-              <div className="grid grid-cols-3 divide-x divide-zinc-800/80 text-center">
-                <div className="px-2">
-                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Laps</p>
-                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">{lapCount}</p>
-                </div>
-                <div className="px-2">
-                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Best EVF</p>
-                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
-                    {Math.round(bestSessionEvf * 100)}%
-                  </p>
-                </div>
-                <div className="px-2">
-                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Marks</p>
-                  <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
-                    {sessionMarks.length}
-                  </p>
-                </div>
-              </div>
-              <div className="mt-4 grid grid-cols-4 gap-2">
+
+              {sessionState === "idle" ? (
                 <button
                   type="button"
                   onClick={toggleSessionRunning}
-                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-emerald-900 hover:text-emerald-100"
-                  title={sessionRunning ? "Pause session timer" : "Resume session timer"}
+                  className="w-full mb-4 flex items-center justify-center gap-2 rounded-lg bg-emerald-600/20 border border-emerald-500/30 px-4 py-3 font-semibold text-emerald-400 transition hover:bg-emerald-600/30"
                 >
-                  {sessionRunning ? (
-                    <Pause className="mx-auto h-4 w-4" />
-                  ) : (
-                    <Play className="mx-auto h-4 w-4" />
-                  )}
+                  <Play className="w-5 h-5" />
+                  Start Session Timer
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setLapCount((count) => Math.max(0, count - 1))}
-                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-zinc-700"
-                  title="Remove lap"
-                >
-                  <Minus className="mx-auto h-4 w-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLapCount((count) => count + 1)}
-                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-zinc-700"
-                  title="Add lap"
-                >
-                  <Plus className="mx-auto h-4 w-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={addSessionMark}
-                  disabled={!analysis}
-                  className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-cyan-900 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-40"
-                  title="Mark current cue"
-                >
-                  <BookmarkPlus className="mx-auto h-4 w-4" />
-                </button>
-              </div>
+              ) : (
+                <div className="grid grid-cols-3 divide-x divide-zinc-800/80 text-center">
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Laps</p>
+                    <p className="mt-1 font-mono text-lg font-bold text-zinc-100">{lapCount}</p>
+                  </div>
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Best EVF</p>
+                    <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
+                      {Math.round(bestSessionEvf * 100)}%
+                    </p>
+                  </div>
+                  <div className="px-2">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Marks</p>
+                    <p className="mt-1 font-mono text-lg font-bold text-zinc-100">
+                      {sessionMarks.length}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {sessionState !== "idle" && (
+                <div className="mt-4 grid grid-cols-4 gap-2">
+                  <button
+                    type="button"
+                    onClick={toggleSessionRunning}
+                    className="rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-zinc-200 transition hover:border-emerald-900 hover:text-emerald-100"
+                    title={sessionState === "running" ? "Pause timer" : "Resume timer"}
+                  >
+                    {sessionState === "running" ? (
+                      <Pause className="mx-auto h-4 w-4" />
+                    ) : (
+                      <Play className="mx-auto h-4 w-4" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLapCount((count) => count + 1)}
+                    className="col-span-2 flex items-center justify-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/70 p-2 text-xs font-medium text-zinc-200 transition hover:border-zinc-700"
+                    title="Add lap"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Lap
+                  </button>
+                  <button
+                    type="button"
+                    onClick={addSessionMark}
+                    disabled={!analysis || sessionState !== "running"}
+                    className="rounded-md border border-cyan-800/40 bg-cyan-900/20 p-2 text-cyan-400 transition hover:border-cyan-500/50 hover:bg-cyan-900/40 disabled:cursor-not-allowed disabled:opacity-40"
+                    title="Mark current cue"
+                  >
+                    <BookmarkPlus className="mx-auto h-4 w-4" />
+                  </button>
+                </div>
+              )}
+              {sessionState !== "idle" && (
+                 <button
+                 type="button"
+                 onClick={handleStopSession}
+                 className="mt-2 w-full flex items-center justify-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-400 transition hover:bg-red-500/20 hover:border-red-400/50"
+               >
+                 Stop Session
+               </button>
+              )}
             </div>
           )}
 
@@ -4374,7 +4410,12 @@ function resolveCameraCtor(mp: any): new (
   ) => { start: () => Promise<void>; stop: () => void };
 }
 
-export default function AnalysisEngine() {
+export default function AnalysisEngine({
+  onSessionComplete,
+}: {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onSessionComplete?: (sessionData: any) => void;
+}) {
   const webcamRef = useRef<Webcam>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokeRangeRef = useRef<StrokeRange>({ minX: 1, maxX: 0, minY: 1, maxY: 0 });
@@ -4426,6 +4467,8 @@ export default function AnalysisEngine() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryKey, setCameraRetryKey] = useState(0);
   const [cameraApiSupported, setCameraApiSupported] = useState(true);
+  const [hasStarted, setHasStarted] = useState(false);
+  const hasStartedRef = useRef(false);
 
   const resetTrackingMemory = useCallback(() => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
@@ -4514,6 +4557,11 @@ export default function AnalysisEngine() {
     setCameraRetryKey((key) => key + 1);
   }, []);
 
+  const handleStartSession = useCallback(() => {
+    setHasStarted(true);
+    hasStartedRef.current = true;
+  }, []);
+
   useEffect(() => {
     if (!hasBrowserCameraApi()) {
       setCameraApiSupported(false);
@@ -4539,7 +4587,7 @@ export default function AnalysisEngine() {
       settings.mirrored
     );
 
-    if (analysisPausedRef.current) {
+    if (analysisPausedRef.current || !hasStartedRef.current) {
       return;
     }
 
@@ -4806,6 +4854,9 @@ export default function AnalysisEngine() {
           onFrame: async () => {
             try {
               await poseInstance.send({ image: videoEl });
+              if (hasStartedRef.current) {
+                await poseInstance.send({ image: videoEl });
+              }
             } catch (error) {
               if (!cancelled) {
                 console.error("Pose frame send failed", error);
@@ -4904,6 +4955,29 @@ export default function AnalysisEngine() {
           className="absolute inset-0 w-full h-full pointer-events-none z-[100]"
           aria-hidden
         />
+
+        {!hasStarted && !cameraError && (
+          <div className="absolute inset-0 z-[120] flex items-center justify-center bg-zinc-950/95 backdrop-blur-md">
+            <div className="max-w-md px-6 text-center">
+              <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full bg-cyan-950/50 border border-cyan-500/30">
+                <Brain className="h-8 w-8 text-cyan-400" />
+              </div>
+              <h2 className="text-2xl font-bold text-zinc-100 mb-2">Welcome to GlideAI</h2>
+              <p className="text-sm leading-relaxed text-zinc-400 mb-8">
+                Your on-device AI swim coach is ready. Position your camera to capture your stroke.
+                Ensure good lighting and keep your upper body in frame for the best analysis.
+              </p>
+              <button
+                type="button"
+                onClick={handleStartSession}
+                className="w-full rounded-lg bg-cyan-600 px-4 py-3 font-semibold text-white transition hover:bg-cyan-500 shadow-[0_0_20px_rgba(8,145,178,0.4)]"
+              >
+                Start Analysis
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="pointer-events-none absolute left-4 top-4 z-[105] flex flex-wrap gap-2">
           <span className="rounded-md border border-zinc-700/80 bg-black/60 px-2.5 py-1 text-xs font-medium text-zinc-200 backdrop-blur-md">
             {cameraViewBadgeLabel(
@@ -4935,6 +5009,23 @@ export default function AnalysisEngine() {
             EVF {analysisState?.evf.left.isEVF || analysisState?.evf.right.isEVF ? "Active" : "Scan"}
           </span>
         </div>
+
+        {hasStarted && !cameraError && (
+          <button
+            type="button"
+            onClick={() =>
+              handleTrackerSettingsChange({
+                cameraFacingMode:
+                  trackerSettings.cameraFacingMode === "user" ? "environment" : "user",
+                mirrored: trackerSettings.cameraFacingMode !== "user",
+              })
+            }
+            className="absolute right-4 top-4 z-[106] flex h-10 w-10 items-center justify-center rounded-full border border-zinc-700/80 bg-black/60 text-zinc-200 backdrop-blur-md transition hover:bg-black/80 hover:text-white shadow-lg"
+            title="Switch Camera"
+          >
+            <SwitchCamera className="h-5 w-5" />
+          </button>
+        )}
 
         {trackerSettings.showCoachCues && !cameraError && (
           <div
@@ -4996,6 +5087,7 @@ export default function AnalysisEngine() {
         onSwimmerProfileChange={handleSwimmerProfileChange}
         interfaceStyle={interfaceStyle}
         onInterfaceStyleChange={setInterfaceStyle}
+        onSessionComplete={onSessionComplete}
       />
     </div>
   );
