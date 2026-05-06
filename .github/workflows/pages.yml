@@ -2,7 +2,7 @@ name: Deploy Phone App
 
 on:
   push:
-    branches: ["main"]
+    branches: ["mobile-pwa"]
   workflow_dispatch:
 
 permissions:
