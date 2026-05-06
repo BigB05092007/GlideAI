@@ -1,10 +1,11 @@
 import type { NextConfig } from "next";
 
 const isElectronExport = process.env.ELECTRON_BUILD === "1";
+const isStaticExport = process.env.STATIC_EXPORT === "1";
 
 const nextConfig: NextConfig = {
   images: { unoptimized: true },
-  ...(isElectronExport
+  ...(isElectronExport || isStaticExport
     ? {
         output: "export" as const,
         assetPrefix: "./",

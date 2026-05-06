@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useEffect, useState } from "react";
 import { LogOut, Waves } from "lucide-react";
 
 const AnalysisEngine = dynamic(
@@ -23,10 +24,20 @@ async function quitApp() {
 }
 
 export default function Home() {
+  const [canQuitApp, setCanQuitApp] = useState(false);
+
+  useEffect(() => {
+    const isElectron =
+      typeof window !== "undefined" &&
+      (Boolean(window.glideApp?.quit) || /Electron/i.test(window.navigator.userAgent));
+
+    setCanQuitApp(isElectron);
+  }, []);
+
   return (
     <main className="min-h-screen flex flex-col">
       {/* Header */}
-      <header className="flex items-center justify-between px-8 py-4 border-b border-glide-border bg-glide-dark/80 backdrop-blur-md sticky top-0 z-50">
+      <header className="flex items-center justify-between gap-4 px-4 py-3 border-b border-glide-border bg-glide-dark/80 backdrop-blur-md sticky top-0 z-50 sm:px-8 sm:py-4">
         <div className="flex items-center gap-3">
           <Waves className="w-7 h-7 text-cyan-400" />
           <div>
@@ -43,24 +54,26 @@ export default function Home() {
             <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
             Live Analysis
           </div>
-          <button
-            type="button"
-            onClick={quitApp}
-            className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-red-400 transition hover:bg-red-500/20 hover:border-red-400/70"
-          >
-            <LogOut className="w-4 h-4" />
-            Quit
-          </button>
+          {canQuitApp && (
+            <button
+              type="button"
+              onClick={quitApp}
+              className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-red-400 transition hover:bg-red-500/20 hover:border-red-400/70"
+            >
+              <LogOut className="w-4 h-4" />
+              Quit
+            </button>
+          )}
         </div>
       </header>
 
       {/* Main Analysis Area */}
-      <section className="flex-1 min-h-0 p-4 lg:p-6">
+      <section className="flex-1 min-h-0 p-2 sm:p-4 lg:p-6">
         <AnalysisEngine />
       </section>
 
       {/* Footer */}
-      <footer className="px-8 py-3 border-t border-glide-border text-center text-xs text-gray-600">
+      <footer className="px-4 py-3 border-t border-glide-border text-center text-xs text-gray-600 sm:px-8">
         GlideAI v1.0.0-Beta &middot; 100% On-Device Processing &middot; Zero Data Upload
       </footer>
     </main>

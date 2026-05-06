@@ -2,3 +2,4 @@ electron/
 out/
 release/
 .next/
+public/vendor/

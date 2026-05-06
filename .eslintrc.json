@@ -5,6 +5,7 @@
     ".next/**",
     "out/**",
     "dist/**",
+    "public/vendor/**",
     "node_modules/**"
   ]
 }

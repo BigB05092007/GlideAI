@@ -69,6 +69,7 @@ interface EVFResult {
 type ArmSide = "left" | "right";
 type PredictionMode = "off" | "assist" | "extended";
 type CameraViewMode = "auto" | "top" | "side" | "top-side" | "front";
+type CameraFacingMode = "user" | "environment";
 type AnalysisView = Exclude<CameraViewMode, "auto"> | "unknown";
 type TrackingState = "live" | "limited" | "predicting" | "lost";
 type InterfaceStyle = "pro" | "pool" | "contrast";
@@ -252,6 +253,7 @@ interface TrackerSettings {
   showTrails: boolean;
   showCoachCues: boolean;
   mirrored: boolean;
+  cameraFacingMode: CameraFacingMode;
   overlayOpacity: number;
 }
 
@@ -398,8 +400,7 @@ const NEON_GREEN = "#39FF14";
 const DEFAULT_LIMB = "rgba(0, 200, 255, 0.55)";
 const DEFAULT_JOINT = "rgba(255, 255, 255, 0.85)";
 const SHOULDER_LINE = "rgba(250, 204, 21, 0.95)";
-const MEDIAPIPE_POSE_VERSION = "0.5.1675469404";
-const POSE_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${MEDIAPIPE_POSE_VERSION}/`;
+const POSE_ASSET_PATH = "vendor/mediapipe/pose/";
 const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
   predictionMode: "assist",
   viewMode: "auto",
@@ -409,6 +410,7 @@ const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
   showTrails: true,
   showCoachCues: true,
   mirrored: true,
+  cameraFacingMode: "user",
   overlayOpacity: 0.9,
 };
 const DEFAULT_SWIMMER_PROFILE: SwimmerProfile = {
@@ -787,6 +789,11 @@ function cameraErrorMessage(error: unknown): string {
   }
 
   return message || fallback;
+}
+
+function appAssetUrl(path: string): string {
+  if (typeof document === "undefined") return path;
+  return new URL(path, document.baseURI).toString();
 }
 
 function isTopLikeView(view: AnalysisView): boolean {
@@ -1385,14 +1392,6 @@ function armVisibilityScore(
   profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ) {
   return getArmSignal(landmarks, side, profile).score;
-}
-
-function armHasCompleteChain(
-  landmarks: NormalizedLandmark[],
-  side: ArmSide,
-  profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
-) {
-  return getArmSignal(landmarks, side, profile).complete;
 }
 
 function pickPrimaryArm(
@@ -4106,6 +4105,22 @@ function MetricsPanel({
               Mirror
             </span>
           </button>
+          <button
+            type="button"
+            onClick={() =>
+              onTrackerSettingsChange({
+                cameraFacingMode:
+                  trackerSettings.cameraFacingMode === "user" ? "environment" : "user",
+                mirrored: trackerSettings.cameraFacingMode !== "user",
+              })
+            }
+            className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2 py-2 text-zinc-300 transition hover:border-cyan-900 hover:text-cyan-100"
+          >
+            <span className="flex items-center justify-center gap-1.5">
+              <Camera className="h-3.5 w-3.5" />
+              {trackerSettings.cameraFacingMode === "user" ? "Front" : "Rear"}
+            </span>
+          </button>
         </div>
         <input
           type="range"
@@ -4436,6 +4451,9 @@ export default function AnalysisEngine() {
       const previousSettings = trackerSettingsRef.current;
       const viewModeChanged =
         patch.viewMode !== undefined && patch.viewMode !== previousSettings.viewMode;
+      const cameraFacingChanged =
+        patch.cameraFacingMode !== undefined &&
+        patch.cameraFacingMode !== previousSettings.cameraFacingMode;
       const nextSettings = { ...previousSettings, ...patch };
       trackerSettingsRef.current = nextSettings;
       setTrackerSettings(nextSettings);
@@ -4444,8 +4462,14 @@ export default function AnalysisEngine() {
         missingFramesRef.current = 0;
       }
 
-      if (viewModeChanged) {
+      if (viewModeChanged || cameraFacingChanged) {
         resetTrackingMemory();
+      }
+
+      if (cameraFacingChanged) {
+        setCameraReady(false);
+        setVideoStreamReady(false);
+        setCameraRetryKey((key) => key + 1);
       }
     },
     [resetTrackingMemory]
@@ -4740,6 +4764,7 @@ export default function AnalysisEngine() {
     let cancelled = false;
     let camera: { stop: () => void } | null = null;
     let pose: PoseInstance | null = null;
+    const strokeBelief = strokeBeliefRef.current;
 
     setCameraReady(false);
     setIsLoaded(false);
@@ -4755,7 +4780,7 @@ export default function AnalysisEngine() {
         const PoseConstructor = resolvePoseCtor(mpPoseMod);
         const CameraConstructor = resolveCameraCtor(mpCameraMod);
         const poseInstance = new PoseConstructor({
-          locateFile: (file: string) => `${POSE_CDN}${file}`,
+          locateFile: (file: string) => appAssetUrl(`${POSE_ASSET_PATH}${file}`),
         });
 
         poseInstance.setOptions({
@@ -4813,7 +4838,7 @@ export default function AnalysisEngine() {
       setIsLoaded(false);
       landmarkMemoryRef.current = createLandmarkTrackingMemory();
       motionHistoryRef.current = createMotionHistory();
-      resetStrokeBelief(strokeBeliefRef.current);
+      resetStrokeBelief(strokeBelief);
       angleMemoryRef.current = createAngleMemory();
       strokeMemoryRef.current = createStrokeMemory();
       styleAccumulatorRef.current = createStyleAccumulator();
@@ -4861,7 +4886,7 @@ export default function AnalysisEngine() {
             videoConstraints={{
               width: { ideal: VIDEO_WIDTH },
               height: { ideal: VIDEO_HEIGHT },
-              facingMode: "user",
+              facingMode: { ideal: trackerSettings.cameraFacingMode },
             }}
             onUserMedia={() => {
               setCameraError(null);

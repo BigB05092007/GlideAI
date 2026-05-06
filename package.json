@@ -7,10 +7,13 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "next dev",
+    "build:web": "next build",
+    "build:static": "cross-env STATIC_EXPORT=1 next build",
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx --max-warnings=0",
     "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix",
+    "clean:artifacts": "node scripts/clean-local-artifacts.mjs",
     "calibrate:stroke": "node scripts/calibrate-stroke-model.mjs data/stroke-samples.json src/data/strokeCalibrationModel.json",
     "electron:dev": "concurrently -k \"cross-env BROWSER=none next dev\" \"wait-on http://127.0.0.1:3000 && cross-env ELECTRON_DEV=1 electron .\"",
     "build:electron": "cross-env ELECTRON_BUILD=1 next build",
