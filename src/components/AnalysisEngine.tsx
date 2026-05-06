@@ -755,10 +755,10 @@ function hasBrowserCameraApi(): boolean {
 
 function cameraUnsupportedMessage(): string {
   if (typeof window !== "undefined" && !window.isSecureContext) {
-    return "Camera access needs a secure page. Open the app at http://localhost:3000 or http://127.0.0.1:3000, or use HTTPS if it is deployed or opened from another device.";
+    return "Camera access needs a secure page. Use HTTPS for the phone app, or use http://localhost:3000 / http://127.0.0.1:3000 only on this development computer.";
   }
 
-  return "This browser does not expose camera access. Open the app in desktop Chrome or Microsoft Edge at http://localhost:3000 or http://127.0.0.1:3000, not inside an embedded preview.";
+  return "This browser does not expose camera access. Open the app in Safari on iPhone, or in Chrome / Microsoft Edge during desktop development.";
 }
 
 function cameraErrorMessage(error: unknown): string {
@@ -3461,11 +3461,16 @@ function MetricsPanel({
   };
 
   const handleStopSession = () => {
+    const finalElapsedMs =
+      sessionState === "running" && sessionStartedAt > 0
+        ? Date.now() - sessionStartedAt
+        : elapsedMs;
+
     if (onSessionComplete) {
       onSessionComplete({
         id: Date.now(),
         date: new Date().toISOString(),
-        durationMs: elapsedMs,
+        durationMs: finalElapsedMs,
         lapCount,
         bestEvf: bestSessionEvf,
         marks: sessionMarks,
@@ -4854,9 +4859,6 @@ export default function AnalysisEngine({
           onFrame: async () => {
             try {
               await poseInstance.send({ image: videoEl });
-              if (hasStartedRef.current) {
-                await poseInstance.send({ image: videoEl });
-              }
             } catch (error) {
               if (!cancelled) {
                 console.error("Pose frame send failed", error);
@@ -4928,7 +4930,7 @@ export default function AnalysisEngine({
       <div
         className={`relative min-h-[360px] w-full flex-1 overflow-hidden rounded-lg border bg-black shadow-2xl sm:min-h-[460px] xl:min-h-[calc(100vh-9rem)] ${selectedInterfaceStyle.videoClass}`}
       >
-        {cameraApiSupported && (
+        {cameraApiSupported && hasStarted && (
           <Webcam
             key={cameraRetryKey}
             ref={webcamRef}

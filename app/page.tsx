@@ -43,6 +43,28 @@ function formatDuration(ms: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function parseStoredSessions(value: string | null): SavedSession[] {
+  if (!value) return [];
+
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed)) return [];
+
+  return parsed.filter((session): session is SavedSession => {
+    if (!session || typeof session !== "object") return false;
+
+    const candidate = session as Partial<SavedSession>;
+    return (
+      typeof candidate.id === "number" &&
+      typeof candidate.date === "string" &&
+      typeof candidate.durationMs === "number" &&
+      typeof candidate.lapCount === "number" &&
+      typeof candidate.bestEvf === "number" &&
+      Array.isArray(candidate.marks) &&
+      typeof candidate.strokeFocus === "string"
+    );
+  });
+}
+
 export default function AppHome() {
   const [canQuitApp, setCanQuitApp] = useState(false);
   const [sessions, setSessions] = useState<SavedSession[]>([]);
@@ -79,9 +101,7 @@ export default function AppHome() {
 
     try {
       const stored = localStorage.getItem("glideai_sessions");
-      if (stored) {
-        setSessions(JSON.parse(stored));
-      }
+      setSessions(parseStoredSessions(stored));
     } catch (e) {
       console.error("Failed to load sessions", e);
     }
