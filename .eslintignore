@@ -1,0 +1,4 @@
+electron/
+out/
+release/
+.next/

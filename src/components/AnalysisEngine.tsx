@@ -33,6 +33,15 @@ import {
   Trophy,
   Zap,
 } from "lucide-react";
+import {
+  createStrokeBelief,
+  resetStrokeBelief,
+  setStrokeCalibrationModel,
+  type StrokeCalibrationModel,
+  type StrokeBeliefState,
+  classifySwimStroke,
+} from "@/lib/strokeClassification";
+import strokeCalibrationModel from "@/data/strokeCalibrationModel.json";
 
 interface Point {
   x: number;
@@ -158,6 +167,8 @@ interface MotionSummary {
 interface MotionHistory {
   leftWrist: MotionTrack;
   rightWrist: MotionTrack;
+  leftElbow: MotionTrack;
+  rightElbow: MotionTrack;
 }
 
 interface ArmAngleTrack {
@@ -1672,6 +1683,8 @@ function createMotionHistory(): MotionHistory {
   return {
     leftWrist: { points: [] },
     rightWrist: { points: [] },
+    leftElbow: { points: [] },
+    rightElbow: { points: [] },
   };
 }
 
@@ -1706,6 +1719,8 @@ function updateMotionHistory(
 ): MotionSummary {
   pushMotionPoint(history.leftWrist, landmarks[15]);
   pushMotionPoint(history.rightWrist, landmarks[16]);
+  pushMotionPoint(history.leftElbow, landmarks[13]);
+  pushMotionPoint(history.rightElbow, landmarks[14]);
 
   return {
     left: summarizeMotion(history.leftWrist),
@@ -2498,132 +2513,37 @@ function classifyStroke(
   landmarks: NormalizedLandmark[],
   shoulders: ShoulderMetrics,
   motion: MotionSummary,
+  motionHistory: MotionHistory,
+  strokeBelief: StrokeBeliefState,
   profile: SwimmerProfile = DEFAULT_SWIMMER_PROFILE
 ): Pick<TechniqueAnalysis, "stroke" | "confidence"> {
-  const leftWrist = landmarks[15];
-  const rightWrist = landmarks[16];
-  const leftElbow = landmarks[13];
-  const rightElbow = landmarks[14];
-  const primaryArm = pickPrimaryArm(landmarks, profile);
+  const leftSignal = getArmSignal(landmarks, "left", profile);
+  const rightSignal = getArmSignal(landmarks, "right", profile);
+  const partialArmCount = [leftSignal.partial, rightSignal.partial].filter(Boolean).length;
+  const lw = landmarks[15];
+  const rw = landmarks[16];
+  const le = landmarks[13];
+  const re = landmarks[14];
+  const bothArmsChainVisible =
+    isVisible(lw, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(rw, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(le, LANDMARK_PARTIAL_VISIBILITY) &&
+    isVisible(re, LANDMARK_PARTIAL_VISIBILITY);
 
-  if (!shoulders.visible) {
-    return { stroke: "Unknown", confidence: 0 };
-  }
+  const result = classifySwimStroke(
+    {
+      landmarks,
+      shoulders,
+      motion,
+      motionHistory,
+      primaryArm: pickPrimaryArm(landmarks, profile),
+      bothArmsChainVisible,
+      partialArmCount,
+    },
+    strokeBelief
+  );
 
-  if (!primaryArm) {
-    return {
-      stroke: "Unknown",
-      confidence: isTopLikeView(shoulders.view) ? 0.28 : 0,
-    };
-  }
-
-  const bothArmsVisible =
-    isVisible(leftWrist, LANDMARK_PARTIAL_VISIBILITY) &&
-    isVisible(rightWrist, LANDMARK_PARTIAL_VISIBILITY) &&
-    isVisible(leftElbow, LANDMARK_PARTIAL_VISIBILITY) &&
-    isVisible(rightElbow, LANDMARK_PARTIAL_VISIBILITY);
-
-  if (isTopLikeView(shoulders.view)) {
-    const leftSignal = getArmSignal(landmarks, "left", profile);
-    const rightSignal = getArmSignal(landmarks, "right", profile);
-    const visibleArmCount = [leftSignal.partial, rightSignal.partial].filter(Boolean).length;
-    const hasStrokeMotion =
-      motion.left.samples + motion.right.samples >= 8 &&
-      motion.left.rangeX + motion.left.rangeY + motion.right.rangeX + motion.right.rangeY >
-        0.075;
-
-    if (bothArmsVisible) {
-      const shoulderWidth = Math.max(shoulders.width, 0.08);
-      const xDominant =
-        motion.left.rangeX + motion.right.rangeX >
-        (motion.left.rangeY + motion.right.rangeY) *
-          (shoulders.view === "top-side" ? 0.95 : 1.15);
-      const wristDelta = xDominant
-        ? Math.abs(leftWrist.x - rightWrist.x)
-        : Math.abs(leftWrist.y - rightWrist.y);
-      const elbowDelta = xDominant
-        ? Math.abs(leftElbow.x - rightElbow.x)
-        : Math.abs(leftElbow.y - rightElbow.y);
-      const armsSynchronized =
-        wristDelta < shoulderWidth * 0.9 && elbowDelta < shoulderWidth * 0.9;
-
-      if (shoulders.view === "top-side") {
-        const leftAboveShoulders = leftWrist.y < shoulders.centerY;
-        const rightAboveShoulders = rightWrist.y < shoulders.centerY;
-        const bothAboveShoulders = leftAboveShoulders && rightAboveShoulders;
-        const bothBelowShoulders = !leftAboveShoulders && !rightAboveShoulders;
-
-        if (armsSynchronized && bothAboveShoulders && hasStrokeMotion) {
-          return { stroke: "Butterfly", confidence: 0.66 };
-        }
-
-        if (armsSynchronized && bothBelowShoulders && hasStrokeMotion) {
-          return { stroke: "Breaststroke", confidence: 0.64 };
-        }
-      }
-
-      if (armsSynchronized && hasStrokeMotion) {
-        return { stroke: "Butterfly", confidence: 0.68 };
-      }
-    }
-
-    return {
-      stroke: "Freestyle",
-      confidence: hasStrokeMotion
-        ? visibleArmCount >= 2
-          ? 0.7
-          : 0.6
-        : visibleArmCount >= 2
-          ? 0.56
-          : 0.46,
-    };
-  }
-
-  if (shoulders.view === "side" || !bothArmsVisible) {
-    const primaryMotion = motion[primaryArm];
-    const completeChain = armHasCompleteChain(landmarks, primaryArm, profile);
-    const hasStrokeMotion =
-      primaryMotion.samples >= 8 &&
-      (primaryMotion.rangeX > 0.055 || primaryMotion.rangeY > 0.055);
-
-    return {
-      stroke: "Freestyle",
-      confidence: hasStrokeMotion
-        ? completeChain
-          ? 0.72
-          : 0.58
-        : completeChain
-          ? 0.54
-          : 0.44,
-    };
-  }
-
-  const shoulderWidth = Math.max(shoulders.width, 0.08);
-  const wristYDelta = Math.abs(leftWrist.y - rightWrist.y);
-  const elbowYDelta = Math.abs(leftElbow.y - rightElbow.y);
-  const armsSynchronized =
-    wristYDelta < shoulderWidth * 0.7 && elbowYDelta < shoulderWidth * 0.7;
-  const leftAboveShoulders = leftWrist.y < shoulders.centerY;
-  const rightAboveShoulders = rightWrist.y < shoulders.centerY;
-  const bothAboveShoulders = leftAboveShoulders && rightAboveShoulders;
-  const bothBelowShoulders = !leftAboveShoulders && !rightAboveShoulders;
-
-  if (armsSynchronized && bothAboveShoulders) {
-    return { stroke: "Butterfly", confidence: 0.72 };
-  }
-
-  if (armsSynchronized && bothBelowShoulders) {
-    return { stroke: "Breaststroke", confidence: 0.68 };
-  }
-
-  if (!armsSynchronized) {
-    return {
-      stroke: bothBelowShoulders ? "Backstroke" : "Freestyle",
-      confidence: 0.74,
-    };
-  }
-
-  return { stroke: "Unknown", confidence: 0.35 };
+  return { stroke: result.stroke as StrokeType, confidence: result.confidence };
 }
 
 function buildTechniqueFeedback(
@@ -4445,6 +4365,7 @@ export default function AnalysisEngine() {
   const strokeRangeRef = useRef<StrokeRange>({ minX: 1, maxX: 0, minY: 1, maxY: 0 });
   const landmarkMemoryRef = useRef<LandmarkTrackingMemory>(createLandmarkTrackingMemory());
   const motionHistoryRef = useRef<MotionHistory>(createMotionHistory());
+  const strokeBeliefRef = useRef<StrokeBeliefState>(createStrokeBelief());
   const angleMemoryRef = useRef<AngleMemory>(createAngleMemory());
   const strokeMemoryRef = useRef<StrokeMemory>(createStrokeMemory());
   const styleAccumulatorRef = useRef<StyleAccumulator>(createStyleAccumulator());
@@ -4463,6 +4384,13 @@ export default function AnalysisEngine() {
   const swimmerProfileRef = useRef<SwimmerProfile>(DEFAULT_SWIMMER_PROFILE);
   const lastFrameTimestampRef = useRef(0);
   const fpsRef = useRef(0);
+
+  useEffect(() => {
+    setStrokeCalibrationModel(strokeCalibrationModel as unknown as StrokeCalibrationModel);
+    return () => {
+      setStrokeCalibrationModel(null);
+    };
+  }, []);
 
   const [analysisState, setAnalysisState] = useState<FullAnalysis | null>(null);
   const [styleCheckIntervalMs, setStyleCheckIntervalMs] = useState(
@@ -4487,6 +4415,7 @@ export default function AnalysisEngine() {
   const resetTrackingMemory = useCallback(() => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
     motionHistoryRef.current = createMotionHistory();
+    resetStrokeBelief(strokeBeliefRef.current);
     angleMemoryRef.current = createAngleMemory();
     strokeMemoryRef.current = createStrokeMemory();
     styleAccumulatorRef.current = createStyleAccumulator();
@@ -4684,6 +4613,7 @@ export default function AnalysisEngine() {
 
     if (armIdentity.swappedChanged) {
       motionHistoryRef.current = createMotionHistory();
+      resetStrokeBelief(strokeBeliefRef.current);
       angleMemoryRef.current = createAngleMemory();
       styleAccumulatorRef.current = createStyleAccumulator();
       styleWindowStartedAtRef.current = now;
@@ -4718,7 +4648,14 @@ export default function AnalysisEngine() {
       styleWindowStartedAtRef.current = now;
     }
 
-    const rawStyle = classifyStroke(lm, shoulders, motion, swimmerProfile);
+    const rawStyle = classifyStroke(
+      lm,
+      shoulders,
+      motion,
+      motionHistoryRef.current,
+      strokeBeliefRef.current,
+      swimmerProfile
+    );
     pushStyleSample(styleAccumulatorRef.current, rawStyle);
 
     const shouldCheckStyle =
@@ -4876,6 +4813,7 @@ export default function AnalysisEngine() {
       setIsLoaded(false);
       landmarkMemoryRef.current = createLandmarkTrackingMemory();
       motionHistoryRef.current = createMotionHistory();
+      resetStrokeBelief(strokeBeliefRef.current);
       angleMemoryRef.current = createAngleMemory();
       strokeMemoryRef.current = createStrokeMemory();
       styleAccumulatorRef.current = createStyleAccumulator();

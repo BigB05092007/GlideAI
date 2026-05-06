@@ -1,12 +1,26 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { Waves } from "lucide-react";
+import { LogOut, Waves } from "lucide-react";
 
 const AnalysisEngine = dynamic(
   () => import("@/components/AnalysisEngine"),
   { ssr: false }
 );
+
+async function quitApp() {
+  if (typeof window === "undefined") return;
+  if (window.glideApp?.quit) {
+    await window.glideApp.quit();
+    return;
+  }
+  const isElectron = /Electron/i.test(window.navigator.userAgent);
+  if (isElectron) {
+    window.location.href = "about:blank";
+    return;
+  }
+  window.close();
+}
 
 export default function Home() {
   return (
@@ -24,9 +38,19 @@ export default function Home() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-xs text-gray-500">
-          <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          Live Analysis
+        <div className="flex items-center gap-3">
+          <div className="hidden sm:flex items-center gap-2 text-xs text-gray-500">
+            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            Live Analysis
+          </div>
+          <button
+            type="button"
+            onClick={quitApp}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-red-400 transition hover:bg-red-500/20 hover:border-red-400/70"
+          >
+            <LogOut className="w-4 h-4" />
+            Quit
+          </button>
         </div>
       </header>
 
