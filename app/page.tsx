@@ -2,7 +2,26 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
-import { LogOut, Waves, Play, Clock, Activity, Trophy, Timer, ChevronLeft, ChevronRight, Menu, X, Trash2, Save, Home } from "lucide-react";
+import {
+  Activity,
+  Award,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardCheck,
+  Clock,
+  Home,
+  LogOut,
+  Menu,
+  Play,
+  Save,
+  Timer,
+  Trash2,
+  TrendingUp,
+  Trophy,
+  Waves,
+  X,
+} from "lucide-react";
 import type { SessionMark } from "@/components/AnalysisEngine";
 
 const AnalysisEngine = dynamic(
@@ -10,7 +29,19 @@ const AnalysisEngine = dynamic(
   { ssr: false }
 );
 
-export interface SavedSession {
+type ReportGrade = "A+" | "A" | "B" | "C" | "D";
+
+export interface SessionReportCard {
+  generatedAt: string;
+  score: number;
+  grade: ReportGrade;
+  headline: string;
+  highlights: string[];
+  improvements: string[];
+  nextSessionFocus: string;
+}
+
+interface SessionDraft {
   id: number;
   date: string;
   durationMs: number;
@@ -18,6 +49,10 @@ export interface SavedSession {
   bestEvf: number;
   marks: SessionMark[];
   strokeFocus: string;
+}
+
+export interface SavedSession extends SessionDraft {
+  reportCard: SessionReportCard;
 }
 
 type ViewType = "menu" | "session" | "history" | "overview";
@@ -43,26 +78,251 @@ function formatDuration(ms: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function average(values: number[]) {
+  if (values.length === 0) return 0;
+  return values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function gradeForScore(score: number): ReportGrade {
+  if (score >= 94) return "A+";
+  if (score >= 85) return "A";
+  if (score >= 74) return "B";
+  if (score >= 62) return "C";
+  return "D";
+}
+
+function reportGradeClass(grade: ReportGrade) {
+  if (grade === "A+" || grade === "A") {
+    return "border-emerald-500/40 bg-emerald-500/10 text-emerald-300";
+  }
+  if (grade === "B") {
+    return "border-cyan-500/40 bg-cyan-500/10 text-cyan-300";
+  }
+  if (grade === "C") {
+    return "border-amber-500/40 bg-amber-500/10 text-amber-300";
+  }
+  return "border-zinc-700 bg-zinc-800/70 text-zinc-300";
+}
+
+function commonCue(marks: SessionMark[]) {
+  const counts = new Map<string, number>();
+  marks.forEach((mark) => {
+    counts.set(mark.cue, (counts.get(mark.cue) ?? 0) + 1);
+  });
+
+  return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null;
+}
+
+function generateSessionReportCard(session: SessionDraft): SessionReportCard {
+  const evfScore = Math.round(clamp(session.bestEvf, 0, 1) * 100);
+  const markedQuality =
+    session.marks.length > 0
+      ? Math.round(average(session.marks.map((mark) => mark.quality)))
+      : evfScore;
+  const lapScore = clamp(session.lapCount * 18, 0, 100);
+  const durationMinutes = session.durationMs / 60000;
+  const sessionEvidenceScore = clamp(
+    45 + session.marks.length * 10 + session.lapCount * 7 + durationMinutes * 2,
+    45,
+    100
+  );
+  const score = Math.round(
+    evfScore * 0.45 +
+      markedQuality * 0.3 +
+      sessionEvidenceScore * 0.15 +
+      lapScore * 0.1
+  );
+  const grade = gradeForScore(score);
+  const primaryCue = commonCue(session.marks);
+
+  const highlights = [
+    evfScore >= 80
+      ? `Strong EVF peak at ${evfScore}%.`
+      : evfScore >= 60
+        ? `EVF is building, with a best hold of ${evfScore}%.`
+        : `Baseline EVF captured at ${evfScore}%.`,
+    session.lapCount > 0
+      ? `Logged ${pluralize(session.lapCount, "lap")} for repeatable tracking.`
+      : "Captured a technique baseline before lap tracking.",
+    session.marks.length > 0
+      ? `Saved ${pluralize(session.marks.length, "coaching mark")} with ${markedQuality}% average quality.`
+      : "Ready for richer notes once cues are marked during the swim.",
+  ];
+
+  const improvements = [
+    evfScore < 70
+      ? "Prioritize high elbow catch pressure before adding speed."
+      : "Keep the elbow angle consistent as pace increases.",
+    primaryCue
+      ? `Revisit cue: ${primaryCue}`
+      : "Add two or three marks next time to capture the exact coaching cues.",
+    session.lapCount === 0
+      ? "Use the lap button at each wall for better set comparison."
+      : "Compare lap count and EVF together after the next set.",
+  ];
+
+  const nextSessionFocus =
+    session.strokeFocus === "Auto"
+      ? "Pick a stroke focus before the next set or keep Auto on for detection."
+      : `Run another ${session.strokeFocus} set and aim for ${Math.min(
+          100,
+          evfScore + 5
+        )}% EVF.`;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    score,
+    grade,
+    headline:
+      score >= 85
+        ? "Clean session with strong technique signals."
+        : score >= 70
+          ? "Solid set with clear next-step cues."
+          : "Useful baseline. Build consistency next.",
+    highlights,
+    improvements,
+    nextSessionFocus,
+  };
+}
+
+function isReportCard(value: unknown): value is SessionReportCard {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<SessionReportCard>;
+  return (
+    typeof candidate.generatedAt === "string" &&
+    typeof candidate.score === "number" &&
+    typeof candidate.grade === "string" &&
+    typeof candidate.headline === "string" &&
+    Array.isArray(candidate.highlights) &&
+    Array.isArray(candidate.improvements) &&
+    candidate.highlights.every((item) => typeof item === "string") &&
+    candidate.improvements.every((item) => typeof item === "string") &&
+    typeof candidate.nextSessionFocus === "string"
+  );
+}
+
 function parseStoredSessions(value: string | null): SavedSession[] {
   if (!value) return [];
 
   const parsed: unknown = JSON.parse(value);
   if (!Array.isArray(parsed)) return [];
 
-  return parsed.filter((session): session is SavedSession => {
-    if (!session || typeof session !== "object") return false;
+  return parsed.flatMap((session): SavedSession[] => {
+    if (!session || typeof session !== "object") return [];
 
     const candidate = session as Partial<SavedSession>;
-    return (
+    const hasRequiredSessionFields =
       typeof candidate.id === "number" &&
       typeof candidate.date === "string" &&
       typeof candidate.durationMs === "number" &&
       typeof candidate.lapCount === "number" &&
       typeof candidate.bestEvf === "number" &&
       Array.isArray(candidate.marks) &&
-      typeof candidate.strokeFocus === "string"
-    );
+      typeof candidate.strokeFocus === "string";
+
+    if (!hasRequiredSessionFields) return [];
+
+    const sessionDraft: SessionDraft = {
+      id: candidate.id!,
+      date: candidate.date!,
+      durationMs: candidate.durationMs!,
+      lapCount: candidate.lapCount!,
+      bestEvf: candidate.bestEvf!,
+      marks: candidate.marks!,
+      strokeFocus: candidate.strokeFocus!,
+    };
+
+    return [
+      {
+        ...sessionDraft,
+        reportCard: isReportCard(candidate.reportCard)
+          ? candidate.reportCard
+          : generateSessionReportCard(sessionDraft),
+      },
+    ];
   });
+}
+
+function ReportCardView({
+  reportCard,
+  compact = false,
+}: {
+  reportCard: SessionReportCard;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={
+        compact
+          ? "mt-4 border-t border-zinc-800/80 pt-4"
+          : "w-full max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-900/50 p-6 text-left"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500">
+            <ClipboardCheck className="h-4 w-4 text-cyan-400" />
+            Report Card
+          </div>
+          <h3 className="text-lg font-bold text-white">{reportCard.headline}</h3>
+          <p className="mt-1 text-sm text-zinc-500">
+            Generated {new Date(reportCard.generatedAt).toLocaleString()}
+          </p>
+        </div>
+        <div
+          className={`flex min-w-[5.5rem] flex-col items-center rounded-xl border px-4 py-3 ${reportGradeClass(
+            reportCard.grade
+          )}`}
+        >
+          <span className="text-3xl font-black leading-none">{reportCard.grade}</span>
+          <span className="mt-1 font-mono text-xs">{reportCard.score}/100</span>
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-5 md:grid-cols-2">
+        <div>
+          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-zinc-500">
+            <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+            Highlights
+          </div>
+          <div className="space-y-2">
+            {reportCard.highlights.map((highlight) => (
+              <p key={highlight} className="text-sm leading-relaxed text-zinc-300">
+                {highlight}
+              </p>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-zinc-500">
+            <TrendingUp className="h-4 w-4 text-amber-400" />
+            Improve
+          </div>
+          <div className="space-y-2">
+            {reportCard.improvements.map((improvement) => (
+              <p key={improvement} className="text-sm leading-relaxed text-zinc-300">
+                {improvement}
+              </p>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-5 flex items-start gap-3 rounded-lg border border-cyan-900/50 bg-cyan-950/20 p-3 text-sm text-cyan-100">
+        <Award className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
+        <p>{reportCard.nextSessionFocus}</p>
+      </div>
+    </div>
+  );
 }
 
 export default function AppHome() {
@@ -107,8 +367,11 @@ export default function AppHome() {
     }
   }, []);
 
-  const handleSessionComplete = (session: SavedSession) => {
-    setPendingSession(session);
+  const handleSessionComplete = (session: SessionDraft) => {
+    setPendingSession({
+      ...session,
+      reportCard: generateSessionReportCard(session),
+    });
     navigateTo("overview");
   };
 
@@ -269,7 +532,7 @@ export default function AppHome() {
         {view === "overview" && (
           <div className="max-w-4xl mx-auto w-full flex-1 flex flex-col items-center justify-center relative py-12">
             <h2 className="text-3xl font-bold text-white mb-6">Session Overview</h2>
-            <div className="p-8 border border-zinc-800 bg-zinc-900/50 rounded-2xl w-full max-w-2xl text-center mb-8">
+            <div className="p-8 border border-zinc-800 bg-zinc-900/50 rounded-2xl w-full max-w-2xl text-center mb-6">
               {pendingSession ? (
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
                   <div>
@@ -293,6 +556,11 @@ export default function AppHome() {
                 <p className="text-zinc-500">No active session pending.</p>
               )}
             </div>
+            {pendingSession && (
+              <div className="mb-8 w-full flex justify-center">
+                <ReportCardView reportCard={pendingSession.reportCard} />
+              </div>
+            )}
             <div className="flex items-center gap-4">
                <button onClick={handleDiscardSession} className="flex items-center gap-2 px-6 py-3 rounded-lg border border-red-500/40 bg-red-500/10 text-red-400 font-semibold hover:bg-red-500/20 transition">
                  <Trash2 className="w-5 h-5"/>
@@ -300,7 +568,7 @@ export default function AppHome() {
                </button>
                <button onClick={handleSaveSession} disabled={!pendingSession} className="flex items-center gap-2 px-8 py-3 rounded-lg bg-cyan-600 text-white font-bold hover:bg-cyan-500 transition shadow-[0_0_20px_rgba(8,145,178,0.4)] disabled:opacity-50">
                  <Save className="w-5 h-5"/>
-                 Save Session
+                 Save to History
                </button>
             </div>
           </div>
@@ -360,6 +628,8 @@ export default function AppHome() {
                         </div>
                       </div>
                     </div>
+
+                    <ReportCardView reportCard={session.reportCard} compact />
                     
                     {session.marks.length > 0 && (
                       <div className="mt-4 pt-4 border-t border-zinc-800/80">
