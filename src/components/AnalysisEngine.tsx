@@ -404,6 +404,8 @@ const STRONG_STYLE_SAMPLE_MIN = 16;
 const STROKE_ACQUIRE_CHECKS = 2;
 const STROKE_SWITCH_CHECKS = 4;
 const STROKE_MEMORY_HOLD_CHECKS = 5;
+const MIN_STYLE_SAMPLE_QUALITY = 0.52;
+const MIN_STYLE_SAMPLE_CONFIDENCE = 0.42;
 const ACTIVE_ARM_ACQUIRE_FRAMES = 8;
 const ACTIVE_ARM_SWITCH_FRAMES = 48;
 const ACTIVE_ARM_HOLD_FRAMES = 45;
@@ -424,7 +426,7 @@ const ANGLE_SMOOTHING_ALPHA = 0.34;
 const ANGLE_MAX_STEP_DEGREES = 9;
 const ANGLE_HOLD_FRAMES = 5;
 const MIN_ANGLE_CONFIDENCE = 0.35;
-const VOICE_CUE_COOLDOWN_MS = 6500;
+const VOICE_CUE_COOLDOWN_MS = 15000;
 const VIDEO_WIDTH = 960;
 const VIDEO_HEIGHT = 540;
 const NEON_GREEN = "#39FF14";
@@ -1776,6 +1778,43 @@ function createStyleAccumulator(): StyleAccumulator {
   return {
     samples: 0,
     votes: {},
+  };
+}
+
+function normalizeStyleSample(
+  result: StyleResult,
+  tracking: TrackingStatus,
+  shoulders: ShoulderMetrics
+): StyleResult {
+  const armComplete = tracking.leftArm.complete || tracking.rightArm.complete;
+  const armCoverage = clamp(
+    Math.max(tracking.leftArm.score, tracking.rightArm.score) / 2.1,
+    0,
+    1
+  );
+  const shoulderFactor = shoulders.visible ? 1 : 0.72;
+  const qualityFactor = clamp(
+    tracking.quality * 0.68 + armCoverage * 0.22 + shoulderFactor * 0.1,
+    0,
+    1
+  );
+  const normalizedConfidence = clamp(result.confidence * qualityFactor, 0, 1);
+  const isReliable =
+    tracking.quality >= MIN_STYLE_SAMPLE_QUALITY &&
+    normalizedConfidence >= MIN_STYLE_SAMPLE_CONFIDENCE &&
+    (armComplete || tracking.quality >= 0.7) &&
+    shoulders.visible;
+
+  if (!isReliable) {
+    return {
+      stroke: "Unknown",
+      confidence: Math.min(normalizedConfidence, 0.46),
+    };
+  }
+
+  return {
+    stroke: result.stroke,
+    confidence: normalizedConfidence,
   };
 }
 
@@ -3403,31 +3442,24 @@ function buildPhoneAgentSuggestions(
   manualCoach: ManualCoachResult,
   fallbackSuggestions: CoachSuggestion[]
 ): CoachSuggestion[] {
-  const suggestions: CoachSuggestion[] = manualCoach.comments.map((comment) => ({
-    id: `phone-agent-${comment.id}`,
-    tone: comment.tone,
-    title: comment.title,
-    detail: comment.immediateCue ?? comment.comment,
-  }));
-
-  suggestions.push({
-    id: "phone-agent-next-set",
-    tone: "good",
-    title: manualCoach.nextSet.title,
-    detail: `${manualCoach.nextSet.reps}: ${manualCoach.nextSet.instruction}`,
-  });
-
-  const source = manualCoach.sources[0];
-  if (source) {
-    suggestions.push({
-      id: `phone-agent-source-${source.id}`,
-      tone: "good",
-      title: source.title,
-      detail: source.excerpt,
-    });
+  const actionable = manualCoach.comments.find(
+    (comment) => comment.tone === "critical" || comment.tone === "warning"
+  );
+  if (actionable) {
+    return [
+      {
+        id: `phone-agent-${actionable.id}`,
+        tone: actionable.tone,
+        title: actionable.title,
+        detail: actionable.immediateCue ?? actionable.comment,
+      },
+    ];
   }
 
-  return (suggestions.length > 0 ? suggestions : fallbackSuggestions).slice(0, 4);
+  const fallbackActionable = fallbackSuggestions.find(
+    (suggestion) => suggestion.tone === "critical" || suggestion.tone === "warning"
+  );
+  return fallbackActionable ? [fallbackActionable] : [];
 }
 
 function createSessionSummary(
@@ -3681,6 +3713,7 @@ function MetricsPanel({
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("ready");
   const lastSpokenCueRef = useRef("");
+  const lastSpokenCueKeyRef = useRef("");
   const lastVoiceAtRef = useRef(0);
   const evf = analysis?.evf ?? null;
   const technique = analysis?.technique ?? null;
@@ -3693,7 +3726,10 @@ function MetricsPanel({
   const profileGeometry = createProfileGeometry(swimmerProfile);
   const manualCoach = evaluatePhoneSwimAgent(createPhoneAgentInput(analysis, strokeFocus));
   const legacyCue = getPrimaryCue(analysis, strokeFocus);
-  const coachCue = manualCoach.liveCue || legacyCue;
+  const topManualComment = manualCoach.comments[0];
+  const hasActionableManualCue =
+    topManualComment?.tone === "critical" || topManualComment?.tone === "warning";
+  const coachCue = hasActionableManualCue ? manualCoach.liveCue || legacyCue : "";
   const coachSuggestions = buildPhoneAgentSuggestions(
     manualCoach,
     buildCoachSuggestions(analysis, trackerSettings, strokeFocus)
@@ -3733,7 +3769,11 @@ function MetricsPanel({
       ? analysisViewLabel(technique.shoulders.view)
       : "--";
   const qualityPercent = Math.round((tracking?.quality ?? 0) * 100);
-  const phoneCoachCue = manualCoach.voiceLine;
+  const phoneCoachCue = hasActionableManualCue ? manualCoach.voiceLine : "";
+  const phoneCoachCueKey = manualCoach.comments[0]
+    ? `${manualCoach.comments[0].id}:${manualCoach.comments[0].tone}`
+    : manualCoach.liveCue;
+  const shouldSpeakCue = hasActionableManualCue;
   const trackingStateLabel = tracking
     ? tracking.state === "predicting"
       ? `Predict ${tracking.predictionFrames}/${tracking.maxPredictionFrames}`
@@ -3772,6 +3812,7 @@ function MetricsPanel({
       if (!force && now - lastVoiceAtRef.current < VOICE_CUE_COOLDOWN_MS) {
         return;
       }
+      if (!phoneCoachCue) return;
 
       window.speechSynthesis.cancel();
       const utterance = new window.SpeechSynthesisUtterance(phoneCoachCue);
@@ -3782,11 +3823,12 @@ function MetricsPanel({
       utterance.onerror = () => setVoiceStatus("blocked");
 
       lastSpokenCueRef.current = phoneCoachCue;
+      lastSpokenCueKeyRef.current = phoneCoachCueKey;
       lastVoiceAtRef.current = now;
       setVoiceStatus("speaking");
       window.speechSynthesis.speak(utterance);
     },
-    [phoneCoachCue, voiceSupported]
+    [phoneCoachCue, phoneCoachCueKey, voiceSupported]
   );
 
   useEffect(() => {
@@ -3799,14 +3841,17 @@ function MetricsPanel({
     }
 
     if (analysisPaused || !sessionRunning) return;
-    if (phoneCoachCue === lastSpokenCueRef.current) return;
+    if (!shouldSpeakCue) return;
+    if (phoneCoachCueKey === lastSpokenCueKeyRef.current) return;
 
     speakCoachCue(false);
   }, [
     analysisPaused,
     phoneCoachCue,
+    phoneCoachCueKey,
     sessionRunning,
     speakCoachCue,
+    shouldSpeakCue,
     voiceEnabled,
     voiceSupported,
   ]);
@@ -3851,7 +3896,9 @@ function MetricsPanel({
     }
 
     setVoiceEnabled(true);
-    speakCoachCue(true);
+    if (shouldSpeakCue) {
+      speakCoachCue(true);
+    }
   };
 
   const finishSession = () => {
@@ -4102,7 +4149,7 @@ function MetricsPanel({
                   </button>
                 </div>
                 <p className="text-sm font-semibold leading-relaxed text-zinc-100">
-                  {coachCue}
+                  {coachCue || "No active cue right now."}
                 </p>
                 {voiceEnabled && (
                   <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500">
@@ -4250,19 +4297,25 @@ function MetricsPanel({
                   </span>
                 </div>
                 <div className="flex flex-col gap-2">
-                  {coachSuggestions.map((suggestion) => (
-                    <div
-                      key={suggestion.id}
-                      className={`rounded-md border px-3 py-2 ${suggestionToneClass(
-                        suggestion.tone
-                      )}`}
-                    >
-                      <p className="text-xs font-semibold">{suggestion.title}</p>
-                      <p className="mt-1 text-xs leading-relaxed opacity-80">
-                        {suggestion.detail}
-                      </p>
-                    </div>
-                  ))}
+                  {coachSuggestions.length > 0 ? (
+                    coachSuggestions.map((suggestion) => (
+                      <div
+                        key={suggestion.id}
+                        className={`rounded-md border px-3 py-2 ${suggestionToneClass(
+                          suggestion.tone
+                        )}`}
+                      >
+                        <p className="text-xs font-semibold">{suggestion.title}</p>
+                        <p className="mt-1 text-xs leading-relaxed opacity-80">
+                          {suggestion.detail}
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-400">
+                      No active suggestions.
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -4861,14 +4914,25 @@ function MetricsPanel({
         </div>
         <div className="flex flex-col gap-2">
           {technique ? (
-            technique.feedback.map((item) => (
-              <p
-                key={item.id}
-                className={`rounded-md border px-3 py-2 text-xs leading-relaxed ${feedbackColor(item.severity)}`}
-              >
-                {item.message}
+            technique.feedback
+              .filter((item) => item.severity === "critical" || item.severity === "warning")
+              .slice(0, 1).length > 0 ? (
+              technique.feedback
+                .filter((item) => item.severity === "critical" || item.severity === "warning")
+                .slice(0, 1)
+                .map((item) => (
+                  <p
+                    key={item.id}
+                    className={`rounded-md border px-3 py-2 text-xs leading-relaxed ${feedbackColor(item.severity)}`}
+                  >
+                    {item.message}
+                  </p>
+                ))
+            ) : (
+              <p className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-400">
+                No active flaw alerts.
               </p>
-            ))
+            )
           ) : (
             <p className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-400">
               Waiting for pose landmarks.
@@ -5257,6 +5321,14 @@ export default function AnalysisEngine({
     );
     const sr = strokeRangeRef.current;
     updateStrokeRange(sr, lm);
+    const tracking = createTrackingStatus(
+      lm,
+      settings,
+      "live",
+      0,
+      fpsRef.current,
+      swimmerProfile
+    );
 
     const evf = stabilizeEVFResult(
       checkEVF(lm, sr, shoulders, motion, swimmerProfile),
@@ -5277,7 +5349,8 @@ export default function AnalysisEngine({
       strokeBeliefRef.current,
       swimmerProfile
     );
-    pushStyleSample(styleAccumulatorRef.current, rawStyle);
+    const normalizedStyle = normalizeStyleSample(rawStyle, tracking, shoulders);
+    pushStyleSample(styleAccumulatorRef.current, normalizedStyle);
 
     const styleIntervalMs = adaptiveStyleIntervalMs(
       baseStyleIntervalMs,
@@ -5294,7 +5367,7 @@ export default function AnalysisEngine({
     if (shouldCheckStyle) {
       const intervalStyle = summarizeStyleSamples(
         styleAccumulatorRef.current,
-        rawStyle
+        normalizedStyle
       );
       const rawTechnique = createTechniqueAnalysisFromStyle(
         lm,
@@ -5321,7 +5394,7 @@ export default function AnalysisEngine({
         lm,
         evf,
         shoulders,
-        rawStyle,
+        normalizedStyle,
         swimmerProfile
       );
     }
@@ -5343,9 +5416,9 @@ export default function AnalysisEngine({
       tracking: createTrackingStatus(
         lm,
         settings,
-        "live",
-        0,
-        fpsRef.current,
+        tracking.state,
+        tracking.predictionFrames,
+        tracking.fps,
         swimmerProfile
       ),
       trails: createMotionTrails(motionHistoryRef.current),
@@ -5474,7 +5547,11 @@ export default function AnalysisEngine({
   const phoneAgent = evaluatePhoneSwimAgent(
     createPhoneAgentInput(analysisState, strokeFocus)
   );
-  const coachCue = phoneAgent.liveCue || getPrimaryCue(analysisState, strokeFocus);
+  const hasActionablePhoneCue =
+    phoneAgent.comments[0]?.tone === "critical" || phoneAgent.comments[0]?.tone === "warning";
+  const coachCue = hasActionablePhoneCue
+    ? phoneAgent.liveCue || getPrimaryCue(analysisState, strokeFocus)
+    : "";
 
   return (
     <div
@@ -5543,7 +5620,7 @@ export default function AnalysisEngine({
           </span>
         </div>
 
-        {trackerSettings.showCoachCues && !cameraError && (
+        {trackerSettings.showCoachCues && !cameraError && coachCue && (
           <div
             className={`pointer-events-none absolute bottom-4 left-4 right-4 z-[105] rounded-lg border px-4 py-3 text-sm font-semibold shadow-xl backdrop-blur-md ${selectedInterfaceStyle.cueClass}`}
           >

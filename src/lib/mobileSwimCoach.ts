@@ -764,21 +764,45 @@ function estimatePhase(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
 function numericStyleScore(input: ManualCoachInput): number {
   return (
     1.1 +
-    input.trackingQuality * 1.25 +
-    input.confidence * 1.05 +
-    (input.completeArmChain ? 0.55 : 0) +
+    input.trackingQuality * 1.35 +
+    input.confidence * 0.95 +
+    (input.completeArmChain ? 0.65 : -0.2) +
     (input.anyEvf ? 0.65 : 0) +
-    input.bestEvfConfidence * 0.45 +
-    (input.lockState === "locked" ? 0.45 : 0) +
+    input.bestEvfConfidence * 0.4 +
+    (input.lockState === "locked" ? 0.5 : 0) +
+    (input.lockState === "holding" ? -0.2 : 0) +
+    (input.lockState === "switching" ? -0.35 : 0) +
+    (input.lockState === "acquiring" ? -0.55 : 0) +
     (input.catchPhaseActive && !input.anyEvf ? -0.45 : 0) +
-    (input.edgeLandmarks > 1 ? -0.45 : 0)
+    (input.edgeLandmarks > 1 ? -0.5 : input.edgeLandmarks > 0 ? -0.2 : 0)
+  );
+}
+
+function styleReadReliability(input: ManualCoachInput): number {
+  return Math.max(
+    0,
+    Math.min(
+      1,
+      input.trackingQuality * 0.44 +
+        input.confidence * 0.24 +
+        (input.completeArmChain ? 0.16 : 0) +
+        (input.lockState === "locked" ? 0.14 : 0) +
+        (input.lockState === "holding" ? 0.06 : 0) -
+        (input.lockState === "acquiring" ? 0.12 : 0) -
+        (input.lockState === "switching" ? 0.08 : 0) -
+        input.edgeLandmarks * 0.08
+    )
   );
 }
 
 function estimateScore(input: ManualCoachInput, kb: StrokeKnowledgeBase): ScoreCriterion {
+  const reliability = styleReadReliability(input);
+  const baseScore = Math.max(1, Math.min(5, Math.round(numericStyleScore(input))));
+  const reliabilityCap =
+    reliability < 0.45 ? 2 : reliability < 0.6 ? 3 : reliability < 0.72 ? 4 : 5;
   return findScore(
     kb,
-    Math.max(1, Math.min(5, Math.round(numericStyleScore(input)))) as ScoreCriterion["score"]
+    Math.min(baseScore, reliabilityCap) as ScoreCriterion["score"]
   );
 }
 
@@ -789,10 +813,12 @@ function hasFeedback(input: ManualCoachInput, id: string): boolean {
 function coachConfidence(input: ManualCoachInput, kb: StrokeKnowledgeBase): number {
   const strokeAligned =
     kb.stroke === strokeFromLabel(input.stroke) || kb.stroke === strokeFromLabel(input.strokeFocus);
+  const reliability = styleReadReliability(input);
   const confidence =
     input.trackingQuality * 48 +
-    input.confidence * 28 +
+    input.confidence * 24 +
     (input.completeArmChain ? 12 : 0) +
+    reliability * 12 +
     (strokeAligned ? 8 : 0) -
     (input.edgeLandmarks >= 2 ? 12 : 0);
 
@@ -1261,7 +1287,7 @@ export function evaluatePhoneSwimAgent(input: ManualCoachInput): ManualCoachResu
   const phase = estimatePhase(input, kb);
   const estimatedScore = estimateScore(input, kb);
   const rubric = buildRubric(input, phase, kb);
-  const comments = buildComments(input, kb, context).slice(0, 2);
+  const comments = buildComments(input, kb, context).slice(0, 1);
   const first = firstActionableComment(comments);
   const nextSet = buildNextSet(input, kb, phase, first);
 
