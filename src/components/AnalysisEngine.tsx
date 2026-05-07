@@ -16,6 +16,7 @@ import {
   Gauge,
   Hand,
   Eye,
+  Lightbulb,
   Menu,
   Minus,
   Palette,
@@ -31,6 +32,8 @@ import {
   Target,
   Timer,
   Trophy,
+  Volume2,
+  VolumeX,
   Zap,
 } from "lucide-react";
 import {
@@ -74,6 +77,8 @@ type AnalysisView = Exclude<CameraViewMode, "auto"> | "unknown";
 type TrackingState = "live" | "limited" | "predicting" | "lost";
 type InterfaceStyle = "pro" | "pool" | "contrast";
 type PanelView = "dashboard" | "coach" | "settings" | "history";
+type SuggestionTone = "good" | "warning" | "critical";
+type VoiceStatus = "ready" | "speaking" | "blocked" | "unsupported";
 
 type StrokeType =
   | "Freestyle"
@@ -87,6 +92,13 @@ interface TechniqueFeedback {
   id: string;
   severity: "good" | "warning" | "critical";
   message: string;
+}
+
+interface CoachSuggestion {
+  id: string;
+  tone: SuggestionTone;
+  title: string;
+  detail: string;
 }
 
 interface ShoulderMetrics {
@@ -309,13 +321,23 @@ interface InterfaceStyleOption {
   vars: CSSProperties;
 }
 
-interface SessionMark {
+export interface SessionMark {
   id: number;
   timeLabel: string;
   stroke: StrokeType;
   quality: number;
   evfConfidence: number;
   cue: string;
+}
+
+export interface SessionCompleteData {
+  id: number;
+  date: string;
+  durationMs: number;
+  lapCount: number;
+  bestEvf: number;
+  marks: SessionMark[];
+  strokeFocus: string;
 }
 
 interface SwimmerProfile {
@@ -371,6 +393,10 @@ const DEFAULT_STYLE_CHECK_INTERVAL_MS = 5000;
 const MIN_STYLE_CHECK_INTERVAL_MS = 3000;
 const MAX_STYLE_CHECK_INTERVAL_MS = 15000;
 const STYLE_CHECK_INTERVAL_STEP_MS = 1000;
+const ACQUIRE_STYLE_CHECK_INTERVAL_MS = 2400;
+const SWITCH_STYLE_CHECK_INTERVAL_MS = 3200;
+const MIN_EARLY_STYLE_WINDOW_MS = 1200;
+const STRONG_STYLE_SAMPLE_MIN = 16;
 const STROKE_ACQUIRE_CHECKS = 2;
 const STROKE_SWITCH_CHECKS = 4;
 const STROKE_MEMORY_HOLD_CHECKS = 5;
@@ -394,6 +420,7 @@ const ANGLE_SMOOTHING_ALPHA = 0.34;
 const ANGLE_MAX_STEP_DEGREES = 9;
 const ANGLE_HOLD_FRAMES = 5;
 const MIN_ANGLE_CONFIDENCE = 0.35;
+const VOICE_CUE_COOLDOWN_MS = 6500;
 const VIDEO_WIDTH = 960;
 const VIDEO_HEIGHT = 540;
 const NEON_GREEN = "#39FF14";
@@ -1645,11 +1672,15 @@ function createTrackingStatus(
   const leftArm = getArmChainStatus(landmarks, "left", profile);
   const rightArm = getArmChainStatus(landmarks, "right", profile);
   const bestArmScore = Math.max(leftArm.score, rightArm.score);
+  const pairedArmScore = Math.min((leftArm.score + rightArm.score) / 3.2, 1);
+  const completeArmBonus = leftArm.complete || rightArm.complete ? 0.08 : 0;
   const quality = clamp(
-    visibleLandmarks / trackedIndices.length * 0.34 +
-      reliableLandmarks / Math.max(trackedIndices.length, 1) * 0.36 +
-      Math.min(bestArmScore / 2.1, 1) * 0.3 -
-      edgeLandmarks * 0.025,
+    visibleLandmarks / trackedIndices.length * 0.28 +
+      reliableLandmarks / Math.max(trackedIndices.length, 1) * 0.32 +
+      Math.min(bestArmScore / 2.1, 1) * 0.28 +
+      pairedArmScore * 0.12 +
+      completeArmBonus -
+      edgeLandmarks * 0.02,
     0,
     1
   );
@@ -1759,6 +1790,71 @@ function pushStyleSample(accumulator: StyleAccumulator, result: StyleResult) {
   accumulator.votes[result.stroke] = vote;
 }
 
+function styleVoteStrength(vote: StyleVote, totalSamples: number): number {
+  const dominance = vote.samples / Math.max(1, totalSamples);
+  const averageConfidence = vote.confidenceTotal / Math.max(1, vote.samples);
+  return dominance * 0.48 + averageConfidence * 0.36 + vote.confidencePeak * 0.16;
+}
+
+function strongestKnownStyleVote(
+  accumulator: StyleAccumulator
+): [StrokeType, StyleVote] | null {
+  const entries = Object.entries(accumulator.votes) as Array<
+    [StrokeType, StyleVote]
+  >;
+  const knownEntries = entries.filter(([stroke]) => stroke !== "Unknown");
+
+  if (knownEntries.length === 0) return null;
+
+  return knownEntries.reduce((best, current) =>
+    styleVoteStrength(current[1], accumulator.samples) >
+    styleVoteStrength(best[1], accumulator.samples)
+      ? current
+      : best
+  );
+}
+
+function hasStrongStyleCandidate(accumulator: StyleAccumulator): boolean {
+  if (accumulator.samples < STRONG_STYLE_SAMPLE_MIN) return false;
+
+  const best = strongestKnownStyleVote(accumulator);
+  if (!best) return false;
+
+  const vote = best[1];
+  const dominance = vote.samples / Math.max(1, accumulator.samples);
+  const averageConfidence = vote.confidenceTotal / Math.max(1, vote.samples);
+
+  return (
+    vote.samples >= 8 &&
+    dominance >= 0.56 &&
+    averageConfidence >= 0.6 &&
+    vote.confidencePeak >= 0.68
+  );
+}
+
+function adaptiveStyleIntervalMs(
+  baseIntervalMs: number,
+  memory: StrokeMemory,
+  accumulator: StyleAccumulator
+): number {
+  if (memory.stableStroke === "Unknown") {
+    return Math.min(baseIntervalMs, ACQUIRE_STYLE_CHECK_INTERVAL_MS);
+  }
+
+  if (
+    memory.candidateStroke !== "Unknown" &&
+    memory.candidateStroke !== memory.stableStroke
+  ) {
+    return Math.min(baseIntervalMs, SWITCH_STYLE_CHECK_INTERVAL_MS);
+  }
+
+  if (hasStrongStyleCandidate(accumulator)) {
+    return Math.min(baseIntervalMs, SWITCH_STYLE_CHECK_INTERVAL_MS);
+  }
+
+  return baseIntervalMs;
+}
+
 function summarizeStyleSamples(
   accumulator: StyleAccumulator,
   fallback: StyleResult
@@ -1772,20 +1868,55 @@ function summarizeStyleSamples(
   }
 
   const knownEntries = entries.filter(([stroke]) => stroke !== "Unknown");
-  const candidates = knownEntries.length > 0 ? knownEntries : entries;
+  const unknownVote = accumulator.votes.Unknown;
+  const knownSamples = knownEntries.reduce(
+    (total, [, vote]) => total + vote.samples,
+    0
+  );
+
+  if (knownEntries.length === 0) {
+    return {
+      stroke: "Unknown",
+      confidence: clamp(
+        fallback.stroke === "Unknown" ? Math.max(fallback.confidence, 0.34) : 0.34,
+        0,
+        0.55
+      ),
+    };
+  }
+
+  const unknownDominance =
+    (unknownVote?.samples ?? 0) / Math.max(1, accumulator.samples);
+  const knownDominance = knownSamples / Math.max(1, accumulator.samples);
+  const candidates = knownEntries;
   const [stroke, vote] = candidates.reduce((best, current) => {
-    const bestScore =
-      best[1].samples * 0.7 + best[1].confidenceTotal * 0.3;
-    const currentScore =
-      current[1].samples * 0.7 + current[1].confidenceTotal * 0.3;
+    const bestScore = styleVoteStrength(best[1], accumulator.samples);
+    const currentScore = styleVoteStrength(current[1], accumulator.samples);
     return currentScore > bestScore ? current : best;
   });
   const dominance = vote.samples / Math.max(1, accumulator.samples);
   const averageConfidence = vote.confidenceTotal / Math.max(1, vote.samples);
+  const knownEvidencePenalty = knownDominance < 0.38 ? 0.78 : 1;
+
+  if (
+    unknownDominance > 0.62 &&
+    dominance < 0.42 &&
+    averageConfidence < 0.66
+  ) {
+    return {
+      stroke: "Unknown",
+      confidence: clamp(unknownDominance * 0.42 + fallback.confidence * 0.28, 0.34, 0.58),
+    };
+  }
 
   return {
     stroke,
-    confidence: clamp(averageConfidence * 0.8 + dominance * 0.2, 0, 0.92),
+    confidence: clamp(
+      (averageConfidence * 0.55 + dominance * 0.28 + vote.confidencePeak * 0.17) *
+        knownEvidencePenalty,
+      0,
+      0.94
+    ),
   };
 }
 
@@ -3117,6 +3248,125 @@ function getPrimaryCue(
   return "Tracking is stable; hold a clean line through entry and catch.";
 }
 
+function suggestionToneClass(tone: SuggestionTone): string {
+  if (tone === "critical") {
+    return "border-red-500/35 bg-red-950/25 text-red-100";
+  }
+  if (tone === "warning") {
+    return "border-amber-500/35 bg-amber-950/25 text-amber-100";
+  }
+  return "border-emerald-500/30 bg-emerald-950/20 text-emerald-100";
+}
+
+function buildCoachSuggestions(
+  analysis: FullAnalysis | null,
+  trackerSettings: TrackerSettings,
+  strokeFocus: StrokeFocus
+): CoachSuggestion[] {
+  if (!analysis) {
+    return [
+      {
+        id: "frame-setup",
+        tone: "warning",
+        title: "Frame setup",
+        detail: "Bring shoulders plus one elbow-wrist path into the camera.",
+      },
+      {
+        id: "view-choice",
+        tone: "good",
+        title: "View choice",
+        detail:
+          trackerSettings.viewMode === "auto"
+            ? "Auto view is ready to choose top, side, or front geometry."
+            : `${cameraViewModeLabel(trackerSettings.viewMode)} view is fixed for this set.`,
+      },
+    ];
+  }
+
+  const { technique, tracking, evf } = analysis;
+  const suggestions: CoachSuggestion[] = [];
+  const bestArm = tracking.leftArm.score >= tracking.rightArm.score
+    ? tracking.leftArm
+    : tracking.rightArm;
+
+  if (tracking.quality < 0.45) {
+    suggestions.push({
+      id: "tracking-quality",
+      tone: "critical",
+      title: "Detection quality",
+      detail: "Improve light, reduce splash glare, or move the camera back.",
+    });
+  } else if (tracking.quality < 0.65) {
+    suggestions.push({
+      id: "tracking-quality",
+      tone: "warning",
+      title: "Detection quality",
+      detail: "Keep one full shoulder-elbow-wrist chain visible through the catch.",
+    });
+  }
+
+  if (tracking.edgeLandmarks >= 2) {
+    suggestions.push({
+      id: "edge",
+      tone: "warning",
+      title: "Re-center",
+      detail: "Landmarks are hitting the frame edge; give the hands more room.",
+    });
+  }
+
+  if (!bestArm.complete) {
+    suggestions.push({
+      id: "arm-chain",
+      tone: "warning",
+      title: "Arm chain",
+      detail: "Aim the camera at the active shoulder, elbow, and wrist.",
+    });
+  }
+
+  if (technique.lockState === "acquiring" || technique.confidence < 0.52) {
+    suggestions.push({
+      id: "stroke-lock",
+      tone: "warning",
+      title: "Stroke lock",
+      detail:
+        strokeFocus === "Auto"
+          ? "Hold one stroke pattern for a few seconds so detection can settle."
+          : `Keep ${strokeFocus} selected while the raw detector settles.`,
+    });
+  }
+
+  if (
+    (evf.left.inCatchPhase || evf.right.inCatchPhase) &&
+    !evf.left.isEVF &&
+    !evf.right.isEVF
+  ) {
+    suggestions.push({
+      id: "catch",
+      tone: "critical",
+      title: "Catch shape",
+      detail: "Tip fingertips down sooner and keep the elbow above the forearm.",
+    });
+  } else if (evf.left.isEVF || evf.right.isEVF) {
+    suggestions.push({
+      id: "catch",
+      tone: "good",
+      title: "Catch shape",
+      detail: "EVF is showing. Hold that shape as you add pressure.",
+    });
+  }
+
+  if (suggestions.length === 0) {
+    suggestions.push({
+      id: "steady",
+      tone: "good",
+      title: "Steady read",
+      detail: "Detection is stable; focus on repeatable entry width and rhythm.",
+    });
+  }
+
+  return suggestions.slice(0, 4);
+}
+
 function createSessionSummary(
   marks: SessionMark[],
   lapCount: number,
@@ -3339,6 +3589,7 @@ function MetricsPanel({
   onSwimmerProfileChange,
   interfaceStyle,
   onInterfaceStyleChange,
+  onSessionComplete,
 }: {
   analysis: FullAnalysis | null;
   styleCheckIntervalMs: number;
@@ -3354,6 +3605,7 @@ function MetricsPanel({
   onSwimmerProfileChange: (patch: Partial<SwimmerProfile>) => void;
   interfaceStyle: InterfaceStyle;
   onInterfaceStyleChange: (style: InterfaceStyle) => void;
+  onSessionComplete?: (sessionData: SessionCompleteData) => void;
 }) {
   const [panelView, setPanelView] = useState<PanelView>("dashboard");
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
@@ -3363,6 +3615,10 @@ function MetricsPanel({
   const [lapCount, setLapCount] = useState(0);
   const [sessionMarks, setSessionMarks] = useState<SessionMark[]>([]);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("ready");
+  const lastSpokenCueRef = useRef("");
+  const lastVoiceAtRef = useRef(0);
   const evf = analysis?.evf ?? null;
   const technique = analysis?.technique ?? null;
   const styleCheck = analysis?.styleCheck ?? null;
@@ -3373,6 +3629,15 @@ function MetricsPanel({
   const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
   const profileGeometry = createProfileGeometry(swimmerProfile);
   const coachCue = getPrimaryCue(analysis, strokeFocus);
+  const coachSuggestions = buildCoachSuggestions(
+    analysis,
+    trackerSettings,
+    strokeFocus
+  );
+  const voiceSupported =
+    typeof window !== "undefined" &&
+    "speechSynthesis" in window &&
+    "SpeechSynthesisUtterance" in window;
   const topViewActive = isTopLikeView(technique?.shoulders.view ?? "unknown");
   const partialSubmersionActive = Boolean(
     technique?.feedback.some((item) => item.id === "partial-submerged")
@@ -3436,6 +3701,65 @@ function MetricsPanel({
       : "Line set: keep entry wide from the shoulder.",
   ];
 
+  const speakCoachCue = useCallback(
+    (force = false) => {
+      if (!voiceSupported) {
+        setVoiceEnabled(false);
+        setVoiceStatus("unsupported");
+        return;
+      }
+
+      const now = Date.now();
+      if (!force && now - lastVoiceAtRef.current < VOICE_CUE_COOLDOWN_MS) {
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+      const utterance = new window.SpeechSynthesisUtterance(coachCue);
+      utterance.rate = 0.95;
+      utterance.pitch = 1;
+      utterance.volume = 0.9;
+      utterance.onend = () => setVoiceStatus("ready");
+      utterance.onerror = () => setVoiceStatus("blocked");
+
+      lastSpokenCueRef.current = coachCue;
+      lastVoiceAtRef.current = now;
+      setVoiceStatus("speaking");
+      window.speechSynthesis.speak(utterance);
+    },
+    [coachCue, voiceSupported]
+  );
+
+  useEffect(() => {
+    if (!voiceEnabled) return;
+
+    if (!voiceSupported) {
+      setVoiceEnabled(false);
+      setVoiceStatus("unsupported");
+      return;
+    }
+
+    if (analysisPaused || !sessionRunning) return;
+    if (coachCue === lastSpokenCueRef.current) return;
+
+    speakCoachCue(false);
+  }, [
+    analysisPaused,
+    coachCue,
+    sessionRunning,
+    speakCoachCue,
+    voiceEnabled,
+    voiceSupported,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (!sessionRunning) return;
 
@@ -3457,6 +3781,37 @@ function MetricsPanel({
 
     setSessionStartedAt(Date.now() - elapsedMs);
     setSessionRunning(true);
+  };
+
+  const toggleVoiceCoach = () => {
+    if (voiceEnabled) {
+      if (voiceSupported) window.speechSynthesis.cancel();
+      setVoiceEnabled(false);
+      setVoiceStatus("ready");
+      return;
+    }
+
+    setVoiceEnabled(true);
+    speakCoachCue(true);
+  };
+
+  const finishSession = () => {
+    const finalElapsedMs = sessionRunning
+      ? Date.now() - sessionStartedAt
+      : elapsedMs;
+
+    onSessionComplete?.({
+      id: Date.now(),
+      date: new Date().toISOString(),
+      durationMs: finalElapsedMs,
+      lapCount,
+      bestEvf: bestSessionEvf,
+      marks: sessionMarks,
+      strokeFocus,
+    });
+
+    setSessionRunning(false);
+    setElapsedMs(finalElapsedMs);
   };
 
   const addSessionMark = () => {
@@ -3646,21 +4001,55 @@ function MetricsPanel({
                   <BookmarkPlus className="mx-auto h-4 w-4" />
                 </button>
               </div>
+              {onSessionComplete && (
+                <button
+                  type="button"
+                  onClick={finishSession}
+                  className="mt-3 w-full rounded-md border border-cyan-800/50 bg-cyan-950/40 px-3 py-2 text-xs font-semibold text-cyan-100 transition hover:border-cyan-500/60 hover:bg-cyan-900/50"
+                >
+                  Finish Session
+                </button>
+              )}
             </div>
           )}
 
           {panelView === "coach" && (
             <>
               <div className={metricCardClass(anyEVF ? "emerald" : "amber")}>
-                <div className="mb-3 flex items-center gap-2">
-                  <Trophy className="h-4 w-4 text-amber-300" />
-                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
-                    Live Cue
-                  </span>
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Trophy className="h-4 w-4 text-amber-300" />
+                    <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                      Live Cue
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={toggleVoiceCoach}
+                    className={`rounded-md border p-2 transition ${themedButtonClass(
+                      voiceEnabled
+                    )}`}
+                    title={
+                      voiceEnabled
+                        ? "Turn voice coach off"
+                        : "Turn voice coach on"
+                    }
+                  >
+                    {voiceEnabled ? (
+                      <Volume2 className="h-3.5 w-3.5" />
+                    ) : (
+                      <VolumeX className="h-3.5 w-3.5" />
+                    )}
+                  </button>
                 </div>
                 <p className="text-sm font-semibold leading-relaxed text-zinc-100">
                   {coachCue}
                 </p>
+                {voiceEnabled && (
+                  <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500">
+                    Voice {voiceStatus}
+                  </p>
+                )}
                 <div className="mt-3 flex flex-col gap-2">
                   {drillSteps.map((step) => (
                     <p
@@ -3669,6 +4058,30 @@ function MetricsPanel({
                     >
                       {step}
                     </p>
+                  ))}
+                </div>
+              </div>
+
+              <div className={metricCardClass("zinc")}>
+                <div className="mb-3 flex items-center gap-2">
+                  <Lightbulb className="h-4 w-4 text-amber-300" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                    Suggestions
+                  </span>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {coachSuggestions.map((suggestion) => (
+                    <div
+                      key={suggestion.id}
+                      className={`rounded-md border px-3 py-2 ${suggestionToneClass(
+                        suggestion.tone
+                      )}`}
+                    >
+                      <p className="text-xs font-semibold">{suggestion.title}</p>
+                      <p className="mt-1 text-xs leading-relaxed opacity-80">
+                        {suggestion.detail}
+                      </p>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -4374,7 +4787,11 @@ function resolveCameraCtor(mp: any): new (
   ) => { start: () => Promise<void>; stop: () => void };
 }
 
-export default function AnalysisEngine() {
+export default function AnalysisEngine({
+  onSessionComplete,
+}: {
+  onSessionComplete?: (sessionData: SessionCompleteData) => void;
+}) {
   const webcamRef = useRef<Webcam>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokeRangeRef = useRef<StrokeRange>({ minX: 1, maxX: 0, minY: 1, maxY: 0 });
@@ -4666,7 +5083,7 @@ export default function AnalysisEngine() {
       angleMemoryRef.current,
       shoulders.view
     );
-    const styleIntervalMs = styleCheckIntervalRef.current;
+    const baseStyleIntervalMs = styleCheckIntervalRef.current;
 
     if (styleWindowStartedAtRef.current === 0) {
       styleWindowStartedAtRef.current = now;
@@ -4682,8 +5099,16 @@ export default function AnalysisEngine() {
     );
     pushStyleSample(styleAccumulatorRef.current, rawStyle);
 
+    const styleIntervalMs = adaptiveStyleIntervalMs(
+      baseStyleIntervalMs,
+      strokeMemoryRef.current,
+      styleAccumulatorRef.current
+    );
+    const elapsedStyleWindowMs = now - styleWindowStartedAtRef.current;
     const shouldCheckStyle =
-      now - styleWindowStartedAtRef.current >= styleIntervalMs;
+      elapsedStyleWindowMs >= styleIntervalMs ||
+      (elapsedStyleWindowMs >= MIN_EARLY_STYLE_WINDOW_MS &&
+        hasStrongStyleCandidate(styleAccumulatorRef.current));
     let technique: TechniqueAnalysis;
 
     if (shouldCheckStyle) {
@@ -4996,6 +5421,7 @@ export default function AnalysisEngine() {
         onSwimmerProfileChange={handleSwimmerProfileChange}
         interfaceStyle={interfaceStyle}
         onInterfaceStyleChange={setInterfaceStyle}
+        onSessionComplete={onSessionComplete}
       />
     </div>
   );
