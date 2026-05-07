@@ -818,7 +818,7 @@ function cameraErrorMessage(error: unknown): string {
   }
 
   if (name === "NotReadableError" || normalized.includes("could not start")) {
-    return "The camera is already in use or Windows blocked it. Close other camera apps and check Windows Privacy > Camera.";
+    return "The camera could not start. Close other camera apps or browser tabs, then press Retry camera. On Android, also try switching Front/Rear camera.";
   }
 
   return message || fallback;
@@ -4996,42 +4996,6 @@ function resolvePoseCtor(mp: any): new (config: PoseConstructorConfig) => PoseIn
   return Ctor as new (config: PoseConstructorConfig) => PoseInstance;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function resolveCameraCtor(mp: any): new (
-  video: HTMLVideoElement,
-  options: {
-    onFrame: () => Promise<void>;
-    width?: number;
-    height?: number;
-  }
-) => { start: () => Promise<void>; stop: () => void } {
-  const windowCamera =
-    typeof window !== "undefined"
-      ? (window as Window & { Camera?: unknown }).Camera
-      : undefined;
-  const Ctor =
-    mp?.Camera || mp?.default?.Camera || windowCamera || mp?.default || mp;
-
-  if (typeof Ctor !== "function") {
-    const keys =
-      mp && typeof mp === "object" ? Object.keys(mp).slice(0, 25) : [];
-    throw new Error(
-      `MediaPipe Camera constructor not found. typeof=${typeof Ctor}; moduleKeys=${keys.join(
-        ","
-      )}`
-    );
-  }
-
-  if (typeof window !== "undefined") {
-    (window as Window & { Camera?: unknown }).Camera = Ctor;
-  }
-
-  return Ctor as new (
-    video: HTMLVideoElement,
-    options: { onFrame: () => Promise<void>; width?: number; height?: number }
-  ) => { start: () => Promise<void>; stop: () => void };
-}
-
 export default function AnalysisEngine({
   onSessionComplete,
 }: {
@@ -5440,8 +5404,9 @@ export default function AnalysisEngine({
     if (!videoEl) return;
 
     let cancelled = false;
-    let camera: { stop: () => void } | null = null;
     let pose: PoseInstance | null = null;
+    let animationFrameId: number | null = null;
+    let sendingFrame = false;
     const strokeBelief = strokeBeliefRef.current;
 
     setCameraReady(false);
@@ -5452,11 +5417,7 @@ export default function AnalysisEngine({
         const mpPoseMod = await import("@mediapipe/pose");
         if (cancelled) return;
 
-        const mpCameraMod = await import("@mediapipe/camera_utils");
-        if (cancelled) return;
-
         const PoseConstructor = resolvePoseCtor(mpPoseMod);
-        const CameraConstructor = resolveCameraCtor(mpCameraMod);
         const poseInstance = new PoseConstructor({
           locateFile: (file: string) => appAssetUrl(`${POSE_ASSET_PATH}${file}`),
         });
@@ -5480,23 +5441,35 @@ export default function AnalysisEngine({
 
         if (!cancelled) setIsLoaded(true);
 
-        const cameraInstance = new CameraConstructor(videoEl, {
-          onFrame: async () => {
-            try {
-              await poseInstance.send({ image: videoEl });
-            } catch (error) {
-              if (!cancelled) {
-                console.error("Pose frame send failed", error);
-              }
-            }
-          },
-          width: VIDEO_WIDTH,
-          height: VIDEO_HEIGHT,
-        });
+        const processFrame = () => {
+          if (cancelled) return;
 
-        camera = cameraInstance;
-        await cameraInstance.start();
-        if (!cancelled) setCameraReady(true);
+          const videoReady =
+            videoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+            videoEl.videoWidth > 0 &&
+            videoEl.videoHeight > 0;
+
+          if (videoReady && !sendingFrame) {
+            sendingFrame = true;
+            void poseInstance
+              .send({ image: videoEl })
+              .catch((error) => {
+                if (!cancelled) {
+                  console.error("Pose frame send failed", error);
+                }
+              })
+              .finally(() => {
+                sendingFrame = false;
+              });
+          }
+
+          animationFrameId = window.requestAnimationFrame(processFrame);
+        };
+
+        if (!cancelled) {
+          setCameraReady(true);
+          animationFrameId = window.requestAnimationFrame(processFrame);
+        }
       } catch (error) {
         if (!cancelled) {
           console.error("Pose engine failed to initialize", error);
@@ -5528,17 +5501,14 @@ export default function AnalysisEngine({
       lastAnalysisRef.current = null;
       lastStateUpdateRef.current = 0;
       missingFramesRef.current = 0;
-      try {
-        camera?.stop();
-      } catch {
-        /* ignore */
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
       }
       try {
         pose?.close();
       } catch {
         /* ignore */
       }
-      camera = null;
       pose = null;
     };
   }, [onResults, videoStreamReady]);
@@ -5569,8 +5539,8 @@ export default function AnalysisEngine({
             mirrored={trackerSettings.mirrored}
             className="relative z-0 w-full h-full object-cover"
             videoConstraints={{
-              width: { ideal: VIDEO_WIDTH },
-              height: { ideal: VIDEO_HEIGHT },
+              width: { ideal: 640 },
+              height: { ideal: 480 },
               facingMode: trackerSettings.cameraFacingMode,
             }}
             onUserMedia={() => {
