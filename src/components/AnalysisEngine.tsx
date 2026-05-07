@@ -4475,6 +4475,7 @@ function MetricsPanel({
               trackerSettings.showSkeleton
             )}`}
           >
+            
             Bones
           </button>
           <button
@@ -4823,7 +4824,7 @@ export default function AnalysisEngine({
       setStrokeCalibrationModel(null);
     };
   }, []);
-
+// Tony was not here btw
   const [analysisState, setAnalysisState] = useState<FullAnalysis | null>(null);
   const [styleCheckIntervalMs, setStyleCheckIntervalMs] = useState(
     DEFAULT_STYLE_CHECK_INTERVAL_MS
@@ -5032,7 +5033,7 @@ export default function AnalysisEngine({
       }
       return;
     }
-
+ // so bored
     if (!rawLandmarks) return;
     missingFramesRef.current = 0;
 
@@ -5243,7 +5244,7 @@ export default function AnalysisEngine({
 
         camera = cameraInstance;
         await cameraInstance.start();
-
+// if you read this you are gay
         if (!cancelled) setCameraReady(true);
       } catch (error) {
         if (!cancelled) {

@@ -12,6 +12,11 @@ dist-electron/
 .env
 .env*.local
 
+# Local manuals and generated manual agent index
+data/manuals/*
+!data/manuals/.gitkeep
+data/swim-manual-index.json
+
 # Debug / OS
 npm-debug.log*
 .DS_Store
