@@ -44,6 +44,7 @@ import {
   type StrokeBeliefState,
   classifySwimStroke,
 } from "@/lib/strokeClassification";
+import { evaluateFrontCrawlCoach } from "@/lib/mobileSwimCoach";
 import strokeCalibrationModel from "@/data/strokeCalibrationModel.json";
 
 interface Point {
@@ -3669,6 +3670,24 @@ function MetricsPanel({
       ? analysisViewLabel(technique.shoulders.view)
       : "--";
   const qualityPercent = Math.round((tracking?.quality ?? 0) * 100);
+  const manualCoach = evaluateFrontCrawlCoach({
+    stroke: technique?.stroke ?? "Unknown",
+    strokeFocus,
+    confidence: technique?.confidence ?? 0,
+    lockState: technique?.lockState ?? "acquiring",
+    trackingQuality: tracking?.quality ?? 0,
+    edgeLandmarks: tracking?.edgeLandmarks ?? 0,
+    completeArmChain: Boolean(
+      tracking?.leftArm.complete || tracking?.rightArm.complete
+    ),
+    anyEvf: anyEVF,
+    catchPhaseActive: Boolean(evf?.left.inCatchPhase || evf?.right.inCatchPhase),
+    bestEvfConfidence: arm?.confidence ?? 0,
+    shoulderView: technique?.shoulders.view ?? "unknown",
+    shoulderSlopeDegrees: technique?.shoulders.slopeDegrees ?? 0,
+    feedbackIds: technique?.feedback.map((item) => item.id) ?? [],
+  });
+  const phoneCoachCue = manualCoach.voiceLine;
   const trackingStateLabel = tracking
     ? tracking.state === "predicting"
       ? `Predict ${tracking.predictionFrames}/${tracking.maxPredictionFrames}`
@@ -3715,19 +3734,19 @@ function MetricsPanel({
       }
 
       window.speechSynthesis.cancel();
-      const utterance = new window.SpeechSynthesisUtterance(coachCue);
+      const utterance = new window.SpeechSynthesisUtterance(phoneCoachCue);
       utterance.rate = 0.95;
       utterance.pitch = 1;
       utterance.volume = 0.9;
       utterance.onend = () => setVoiceStatus("ready");
       utterance.onerror = () => setVoiceStatus("blocked");
 
-      lastSpokenCueRef.current = coachCue;
+      lastSpokenCueRef.current = phoneCoachCue;
       lastVoiceAtRef.current = now;
       setVoiceStatus("speaking");
       window.speechSynthesis.speak(utterance);
     },
-    [coachCue, voiceSupported]
+    [phoneCoachCue, voiceSupported]
   );
 
   useEffect(() => {
@@ -3740,12 +3759,12 @@ function MetricsPanel({
     }
 
     if (analysisPaused || !sessionRunning) return;
-    if (coachCue === lastSpokenCueRef.current) return;
+    if (phoneCoachCue === lastSpokenCueRef.current) return;
 
     speakCoachCue(false);
   }, [
     analysisPaused,
-    coachCue,
+    phoneCoachCue,
     sessionRunning,
     speakCoachCue,
     voiceEnabled,
@@ -4058,6 +4077,56 @@ function MetricsPanel({
                     >
                       {step}
                     </p>
+                  ))}
+                </div>
+              </div>
+
+              <div className={metricCardClass(manualCoach.estimatedScore.score >= 3 ? "cyan" : "amber")}>
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Brain className="h-4 w-4 text-cyan-400" />
+                    <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+                      Manual Coach
+                    </span>
+                  </div>
+                  <span className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2 py-1 font-mono text-xs text-zinc-300">
+                    {manualCoach.estimatedScore.score}/5
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+                    <p className="font-semibold text-zinc-200">
+                      {manualCoach.phase.label}
+                    </p>
+                    <p className="mt-1 text-zinc-500">{manualCoach.phase.levels}</p>
+                  </div>
+                  <div className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+                    <p className="font-semibold text-zinc-200">
+                      {manualCoach.estimatedScore.label}
+                    </p>
+                    <p className="mt-1 text-zinc-500">Front crawl</p>
+                  </div>
+                </div>
+                <div className="mt-3 flex flex-col gap-2">
+                  {manualCoach.comments.map((comment) => (
+                    <div
+                      key={comment.id}
+                      className={`rounded-md border px-3 py-2 ${suggestionToneClass(
+                        comment.tone
+                      )}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold">{comment.title}</p>
+                        {comment.drill && (
+                          <span className="shrink-0 rounded bg-black/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] opacity-80">
+                            {comment.drill}
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed opacity-80">
+                        {comment.comment}
+                      </p>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -5033,7 +5102,6 @@ export default function AnalysisEngine({
       }
       return;
     }
- // so bored
     if (!rawLandmarks) return;
     missingFramesRef.current = 0;
 
@@ -5244,7 +5312,6 @@ export default function AnalysisEngine({
 
         camera = cameraInstance;
         await cameraInstance.start();
-// if you read this you are gay
         if (!cancelled) setCameraReady(true);
       } catch (error) {
         if (!cancelled) {
