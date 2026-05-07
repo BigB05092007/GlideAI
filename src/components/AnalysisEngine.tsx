@@ -44,7 +44,7 @@ import {
   type StrokeBeliefState,
   classifySwimStroke,
 } from "@/lib/strokeClassification";
-import { evaluateFrontCrawlCoach } from "@/lib/mobileSwimCoach";
+import { evaluateSwimStyleCoach } from "@/lib/mobileSwimCoach";
 import strokeCalibrationModel from "@/data/strokeCalibrationModel.json";
 
 interface Point {
@@ -3670,7 +3670,7 @@ function MetricsPanel({
       ? analysisViewLabel(technique.shoulders.view)
       : "--";
   const qualityPercent = Math.round((tracking?.quality ?? 0) * 100);
-  const manualCoach = evaluateFrontCrawlCoach({
+  const manualCoach = evaluateSwimStyleCoach({
     stroke: technique?.stroke ?? "Unknown",
     strokeFocus,
     confidence: technique?.confidence ?? 0,
@@ -4104,8 +4104,40 @@ function MetricsPanel({
                     <p className="font-semibold text-zinc-200">
                       {manualCoach.estimatedScore.label}
                     </p>
-                    <p className="mt-1 text-zinc-500">Front crawl</p>
+                    <p className="mt-1 text-zinc-500">{manualCoach.strokeLabel}</p>
                   </div>
+                </div>
+                <div className="mt-3 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-zinc-200">
+                      {manualCoach.primaryFocus}
+                    </p>
+                    <span className="font-mono text-[11px] text-cyan-300">
+                      {manualCoach.confidence}% read
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                    {manualCoach.inferredCause}
+                  </p>
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                  {manualCoach.rubric.slice(0, 4).map((item) => (
+                    <div
+                      key={item.skill}
+                      className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2"
+                      title={item.reason}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="truncate font-semibold text-zinc-200">
+                          {item.skill}
+                        </p>
+                        <span className="font-mono text-[11px] text-cyan-300">
+                          {item.score}/5
+                        </span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-zinc-500">{item.cue}</p>
+                    </div>
+                  ))}
                 </div>
                 <div className="mt-3 flex flex-col gap-2">
                   {manualCoach.comments.map((comment) => (
@@ -4126,8 +4158,27 @@ function MetricsPanel({
                       <p className="mt-1 text-xs leading-relaxed opacity-80">
                         {comment.comment}
                       </p>
+                      {comment.evidence && (
+                        <p className="mt-1 text-[11px] leading-relaxed opacity-60">
+                          {comment.evidence}
+                        </p>
+                      )}
                     </div>
                   ))}
+                </div>
+                <div className="mt-3 rounded-md border border-cyan-900/60 bg-cyan-950/20 px-3 py-2 text-xs text-cyan-50">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-semibold">{manualCoach.nextSet.title}</p>
+                    <span className="font-mono text-[11px] text-cyan-300">
+                      {manualCoach.nextSet.reps}
+                    </span>
+                  </div>
+                  <p className="mt-1 leading-relaxed text-cyan-100/80">
+                    {manualCoach.nextSet.instruction}
+                  </p>
+                  <p className="mt-1 leading-relaxed text-cyan-200/60">
+                    {manualCoach.nextSet.successMetric}
+                  </p>
                 </div>
               </div>
 

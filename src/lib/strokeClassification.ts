@@ -581,9 +581,16 @@ export function classifySwimStroke(
       };
     }
 
+    if (view === "side") {
+      return {
+        stroke: "Unknown",
+        confidence: 0.48,
+      };
+    }
+
     return {
       stroke: "Freestyle",
-      confidence: 0.58,
+      confidence: 0.5,
     };
   }
 
@@ -782,7 +789,10 @@ export function classifySwimStroke(
     topView: view === "top",
     topSideView: view === "top-side",
   });
-  const calibrated = applyCalibrationAdjustments(instant, features, calibrationModel);
+  const instantLogits = instant.map((p) =>
+    Math.log(clamp(p, 1e-5, 1))
+  ) as [number, number, number, number];
+  const calibrated = applyCalibrationAdjustments(instantLogits, features, calibrationModel);
   const calibratedProbs = softmaxProbs(calibrated);
   const probs: readonly number[] = belief
     ? fuseBelief(belief, calibratedProbs as [number, number, number, number])
@@ -795,6 +805,7 @@ export function classifySwimStroke(
 
   const best = order[0]!;
   const second = order[1]!;
+  const probabilityGap = best.p - second.p;
 
   let confidence = clamp((best.p - second.p) / Math.max(best.p, 0.075), 0.34, 0.93);
 
@@ -804,8 +815,18 @@ export function classifySwimStroke(
   if (!pairedOk && (best.i === IDX.FI || best.i === IDX.BR)) {
     confidence = Math.min(confidence, 0.68);
   }
+  if (!hasSolidMotion) {
+    confidence = Math.min(confidence, 0.58);
+  }
+  if (probabilityGap < 0.075) {
+    confidence *= 0.72;
+  }
 
-  if ((confidence < 0.5 && hNorm > 0.78) || best.p < 0.24) {
+  if (
+    (confidence < 0.5 && hNorm > 0.78) ||
+    best.p < 0.28 ||
+    probabilityGap < 0.045
+  ) {
     return { stroke: "Unknown", confidence: clamp(best.p + 0.12, 0.28, 0.52) };
   }
 
