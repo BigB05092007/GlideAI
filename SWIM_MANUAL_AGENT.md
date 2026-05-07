@@ -3,22 +3,30 @@
 This is a small local Ollama agent for asking questions against a swimming instruction manual.
 It keeps the manual and generated search index on your machine.
 
+## In-App Phone Agent
+
+The phone app uses `evaluatePhoneSwimAgent` from `src/lib/mobileSwimCoach.ts`. It is a bundled, phone-local keyword retrieval agent over the stroke curriculum, so the app does not need Node, file-system access, Ollama, or a network connection during a swim session.
+
+The CLI below remains useful for desktop manual experiments and richer local Ollama Q&A.
+
 ## Setup
 
 1. Install and start Ollama.
 2. Pull a chat model:
 
 ```powershell
-ollama pull llama3.2
+ollama pull gemma3:270m
 ```
 
-3. Pull the embedding model for better manual search:
+`gemma3:270m` is the default because it is the lightest practical Ollama chat model for local phone-class hardware.
+
+3. Optional: pull an embedding model for better manual search:
 
 ```powershell
 ollama pull nomic-embed-text
 ```
 
-The agent can still run without the embedding model, but it will fall back to keyword search.
+The agent runs without the embedding model and falls back to keyword search by default. Set `OLLAMA_EMBED_MODEL` only when you want vector search.
 
 ## Add A Manual
 
@@ -54,8 +62,9 @@ Defaults:
 
 ```powershell
 $env:OLLAMA_HOST="http://127.0.0.1:11434"
-$env:OLLAMA_CHAT_MODEL="llama3.2"
-$env:OLLAMA_EMBED_MODEL="nomic-embed-text"
+$env:OLLAMA_CHAT_MODEL="gemma3:270m"
+$env:OLLAMA_EMBED_MODEL=""
+$env:OLLAMA_NUM_CTX="4096"
 $env:SWIM_AGENT_INDEX="data/swim-manual-index.json"
 $env:OLLAMA_REQUEST_TIMEOUT_MS="120000"
 ```

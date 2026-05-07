@@ -1,5 +1,4 @@
 'use client';
-// DONE BY VLAD AND A BIT OF CODEX AND A BIT OF CURSOR AND BRETT FOR MOTIVATION + TONY FOR VIBES
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import Webcam from "react-webcam";
@@ -44,7 +43,11 @@ import {
   type StrokeBeliefState,
   classifySwimStroke,
 } from "@/lib/strokeClassification";
-import { evaluateSwimStyleCoach } from "@/lib/mobileSwimCoach";
+import {
+  evaluatePhoneSwimAgent,
+  type ManualCoachInput,
+  type ManualCoachResult,
+} from "@/lib/mobileSwimCoach";
 import strokeCalibrationModel from "@/data/strokeCalibrationModel.json";
 
 interface Point {
@@ -3175,6 +3178,34 @@ function pickDisplayArm(evf: EVFResult): ArmEVF {
   return leftScore >= rightScore ? evf.left : evf.right;
 }
 
+function createPhoneAgentInput(
+  analysis: FullAnalysis | null,
+  strokeFocus: StrokeFocus
+): ManualCoachInput {
+  const evf = analysis?.evf ?? null;
+  const technique = analysis?.technique ?? null;
+  const tracking = analysis?.tracking ?? null;
+  const displayArm = evf ? pickDisplayArm(evf) : null;
+
+  return {
+    stroke: technique?.stroke ?? "Unknown",
+    strokeFocus,
+    confidence: technique?.confidence ?? 0,
+    lockState: technique?.lockState ?? "acquiring",
+    trackingQuality: tracking?.quality ?? 0,
+    edgeLandmarks: tracking?.edgeLandmarks ?? 0,
+    completeArmChain: Boolean(
+      tracking?.leftArm.complete || tracking?.rightArm.complete
+    ),
+    anyEvf: Boolean(evf?.left.isEVF || evf?.right.isEVF),
+    catchPhaseActive: Boolean(evf?.left.inCatchPhase || evf?.right.inCatchPhase),
+    bestEvfConfidence: displayArm?.confidence ?? 0,
+    shoulderView: technique?.shoulders.view ?? "unknown",
+    shoulderSlopeDegrees: technique?.shoulders.slopeDegrees ?? 0,
+    feedbackIds: technique?.feedback.map((item) => item.id) ?? [],
+  };
+}
+
 function feedbackColor(severity: TechniqueFeedback["severity"]) {
   if (severity === "good") {
     return "border-emerald-800/70 bg-emerald-950/35 text-emerald-100";
@@ -3366,6 +3397,37 @@ function buildCoachSuggestions(
   }
 
   return suggestions.slice(0, 4);
+}
+
+function buildPhoneAgentSuggestions(
+  manualCoach: ManualCoachResult,
+  fallbackSuggestions: CoachSuggestion[]
+): CoachSuggestion[] {
+  const suggestions: CoachSuggestion[] = manualCoach.comments.map((comment) => ({
+    id: `phone-agent-${comment.id}`,
+    tone: comment.tone,
+    title: comment.title,
+    detail: comment.immediateCue ?? comment.comment,
+  }));
+
+  suggestions.push({
+    id: "phone-agent-next-set",
+    tone: "good",
+    title: manualCoach.nextSet.title,
+    detail: `${manualCoach.nextSet.reps}: ${manualCoach.nextSet.instruction}`,
+  });
+
+  const source = manualCoach.sources[0];
+  if (source) {
+    suggestions.push({
+      id: `phone-agent-source-${source.id}`,
+      tone: "good",
+      title: source.title,
+      detail: source.excerpt,
+    });
+  }
+
+  return (suggestions.length > 0 ? suggestions : fallbackSuggestions).slice(0, 4);
 }
 
 function createSessionSummary(
@@ -3629,11 +3691,12 @@ function MetricsPanel({
   const anyEVF = evf ? evf.left.isEVF || evf.right.isEVF : false;
   const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
   const profileGeometry = createProfileGeometry(swimmerProfile);
-  const coachCue = getPrimaryCue(analysis, strokeFocus);
-  const coachSuggestions = buildCoachSuggestions(
-    analysis,
-    trackerSettings,
-    strokeFocus
+  const manualCoach = evaluatePhoneSwimAgent(createPhoneAgentInput(analysis, strokeFocus));
+  const legacyCue = getPrimaryCue(analysis, strokeFocus);
+  const coachCue = manualCoach.liveCue || legacyCue;
+  const coachSuggestions = buildPhoneAgentSuggestions(
+    manualCoach,
+    buildCoachSuggestions(analysis, trackerSettings, strokeFocus)
   );
   const voiceSupported =
     typeof window !== "undefined" &&
@@ -3670,23 +3733,6 @@ function MetricsPanel({
       ? analysisViewLabel(technique.shoulders.view)
       : "--";
   const qualityPercent = Math.round((tracking?.quality ?? 0) * 100);
-  const manualCoach = evaluateSwimStyleCoach({
-    stroke: technique?.stroke ?? "Unknown",
-    strokeFocus,
-    confidence: technique?.confidence ?? 0,
-    lockState: technique?.lockState ?? "acquiring",
-    trackingQuality: tracking?.quality ?? 0,
-    edgeLandmarks: tracking?.edgeLandmarks ?? 0,
-    completeArmChain: Boolean(
-      tracking?.leftArm.complete || tracking?.rightArm.complete
-    ),
-    anyEvf: anyEVF,
-    catchPhaseActive: Boolean(evf?.left.inCatchPhase || evf?.right.inCatchPhase),
-    bestEvfConfidence: arm?.confidence ?? 0,
-    shoulderView: technique?.shoulders.view ?? "unknown",
-    shoulderSlopeDegrees: technique?.shoulders.slopeDegrees ?? 0,
-    feedbackIds: technique?.feedback.map((item) => item.id) ?? [],
-  });
   const phoneCoachCue = manualCoach.voiceLine;
   const trackingStateLabel = tracking
     ? tracking.state === "predicting"
@@ -3709,15 +3755,9 @@ function MetricsPanel({
         )
       : qualityPercent;
   const drillSteps = [
-    strokeFocus === "Auto"
-      ? `Auto focus: ${technique?.stroke ?? "Scanning"}`
-      : `${strokeFocus} focus`,
-    anyEVF
-      ? "EVF hold: keep the elbow high through pressure."
-      : "Catch set: tip fingertips down before the pull.",
-    tracking && tracking.quality < 0.55
-      ? "Camera set: keep one full arm chain visible."
-      : "Line set: keep entry wide from the shoulder.",
+    `${manualCoach.strokeLabel}: ${manualCoach.phase.label} plan`,
+    manualCoach.primaryFocus,
+    `${manualCoach.nextSet.title}: ${manualCoach.nextSet.reps}`,
   ];
 
   const speakCoachCue = useCallback(
@@ -4086,12 +4126,17 @@ function MetricsPanel({
                   <div className="flex items-center gap-2">
                     <Brain className="h-4 w-4 text-cyan-400" />
                     <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
-                      Manual Coach
+                      Phone Agent
                     </span>
                   </div>
-                  <span className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2 py-1 font-mono text-xs text-zinc-300">
-                    {manualCoach.estimatedScore.score}/5
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400">
+                      Local
+                    </span>
+                    <span className="rounded-md border border-zinc-800 bg-zinc-900/70 px-2 py-1 font-mono text-xs text-zinc-300">
+                      {manualCoach.estimatedScore.score}/5
+                    </span>
+                  </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <div className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2">
@@ -4166,6 +4211,21 @@ function MetricsPanel({
                     </div>
                   ))}
                 </div>
+                {manualCoach.sources.length > 0 && (
+                  <div className="mt-3 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <p className="font-semibold text-zinc-300">
+                        {manualCoach.sources[0].title}
+                      </p>
+                      <span className="font-mono text-[11px] text-cyan-300">
+                        {manualCoach.sources[0].score}
+                      </span>
+                    </div>
+                    <p className="line-clamp-3 leading-relaxed text-zinc-500">
+                      {manualCoach.sources[0].excerpt}
+                    </p>
+                  </div>
+                )}
                 <div className="mt-3 rounded-md border border-cyan-900/60 bg-cyan-950/20 px-3 py-2 text-xs text-cyan-50">
                   <div className="flex items-center justify-between gap-2">
                     <p className="font-semibold">{manualCoach.nextSet.title}</p>
@@ -4186,7 +4246,7 @@ function MetricsPanel({
                 <div className="mb-3 flex items-center gap-2">
                   <Lightbulb className="h-4 w-4 text-amber-300" />
                   <span className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
-                    Suggestions
+                    Agent Plan
                   </span>
                 </div>
                 <div className="flex flex-col gap-2">
@@ -4944,7 +5004,7 @@ export default function AnalysisEngine({
       setStrokeCalibrationModel(null);
     };
   }, []);
-// Tony was not here btw
+
   const [analysisState, setAnalysisState] = useState<FullAnalysis | null>(null);
   const [styleCheckIntervalMs, setStyleCheckIntervalMs] = useState(
     DEFAULT_STYLE_CHECK_INTERVAL_MS
@@ -5411,7 +5471,10 @@ export default function AnalysisEngine({
   }, [onResults, videoStreamReady]);
 
   const selectedInterfaceStyle = getInterfaceStyleOption(interfaceStyle);
-  const coachCue = getPrimaryCue(analysisState, strokeFocus);
+  const phoneAgent = evaluatePhoneSwimAgent(
+    createPhoneAgentInput(analysisState, strokeFocus)
+  );
+  const coachCue = phoneAgent.liveCue || getPrimaryCue(analysisState, strokeFocus);
 
   return (
     <div

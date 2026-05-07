@@ -12,12 +12,13 @@ const DEFAULT_CHUNK_OVERLAP = 240;
 const TOP_K = 5;
 
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replace(/\/$/, "");
-const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "llama3.2";
-const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL ?? "nomic-embed-text";
+const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "gemma3:270m";
+const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL?.trim() || null;
 const INDEX_PATH = process.env.SWIM_AGENT_INDEX ?? DEFAULT_INDEX_PATH;
 const OLLAMA_REQUEST_TIMEOUT_MS = Number(process.env.OLLAMA_REQUEST_TIMEOUT_MS ?? 120000);
 const OLLAMA_EMBED_TIMEOUT_MS = Number(process.env.OLLAMA_EMBED_TIMEOUT_MS ?? 15000);
 const OLLAMA_STATUS_TIMEOUT_MS = Number(process.env.OLLAMA_STATUS_TIMEOUT_MS ?? 3000);
+const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX ?? 4096);
 
 function usage() {
   console.log(`
@@ -36,8 +37,9 @@ Examples:
 
 Environment:
   OLLAMA_HOST=http://127.0.0.1:11434
-  OLLAMA_CHAT_MODEL=llama3.2
-  OLLAMA_EMBED_MODEL=nomic-embed-text
+  OLLAMA_CHAT_MODEL=gemma3:270m
+  OLLAMA_EMBED_MODEL=
+  OLLAMA_NUM_CTX=4096
   SWIM_AGENT_INDEX=data/swim-manual-index.json
   OLLAMA_REQUEST_TIMEOUT_MS=120000
 `);
@@ -167,10 +169,12 @@ async function ollamaJson(endpoint, body, timeoutMs = OLLAMA_REQUEST_TIMEOUT_MS)
   return response.json();
 }
 
-async function embedBatch(texts) {
+async function embedBatch(texts, model = EMBED_MODEL) {
+  if (!model) throw new Error("No Ollama embedding model is configured.");
+
   try {
     const result = await ollamaJson("/api/embed", {
-      model: EMBED_MODEL,
+      model,
       input: texts,
     }, OLLAMA_EMBED_TIMEOUT_MS);
 
@@ -182,7 +186,7 @@ async function embedBatch(texts) {
   const embeddings = [];
   for (const text of texts) {
     const result = await ollamaJson("/api/embeddings", {
-      model: EMBED_MODEL,
+      model,
       prompt: text,
     }, OLLAMA_EMBED_TIMEOUT_MS);
     if (!Array.isArray(result.embedding)) {
@@ -194,6 +198,12 @@ async function embedBatch(texts) {
 }
 
 async function tryEmbedChunks(chunks) {
+  if (!EMBED_MODEL) {
+    console.warn("Embedding skipped: OLLAMA_EMBED_MODEL is not set.");
+    console.warn("The agent will use keyword retrieval. Set OLLAMA_EMBED_MODEL=nomic-embed-text for better search.");
+    return { chunks, embeddingModel: null };
+  }
+
   try {
     const embedded = [];
     const batchSize = 12;
@@ -257,7 +267,7 @@ async function retrieveChunks(index, question) {
 
   if (hasEmbeddings && index.embeddingModel) {
     try {
-      const [queryEmbedding] = await embedBatch([question]);
+      const [queryEmbedding] = await embedBatch([question], index.embeddingModel);
       return index.chunks
         .map((chunk) => ({
           ...chunk,
@@ -312,7 +322,7 @@ async function askOllama(question, index, history = []) {
     messages,
     options: {
       temperature: 0.2,
-      num_ctx: 8192,
+      num_ctx: OLLAMA_NUM_CTX,
     },
   });
 

@@ -1,5 +1,5 @@
 export type ManualCoachTone = "good" | "warning" | "critical";
-export type ManualStroke = "Freestyle" | "Backstroke" | "Breaststroke";
+export type ManualStroke = "Freestyle" | "Backstroke" | "Butterfly" | "Breaststroke";
 
 export interface ManualPhase {
   id: "beginner" | "intermediate" | "advanced";
@@ -69,17 +69,20 @@ export interface RubricRating {
 }
 
 export interface ManualCoachResult {
-  model: "stroke-manual-reasoner-v3";
+  model: "glide-phone-manual-agent-v1";
+  agentMode: "phone-local-keyword-rag";
   stroke: ManualStroke;
   strokeLabel: string;
   phase: ManualPhase;
   estimatedScore: ScoreCriterion;
   confidence: number;
+  liveCue: string;
   primaryFocus: string;
   inferredCause: string;
   nextSet: ManualCoachSet;
   rubric: RubricRating[];
   comments: ManualCoachComment[];
+  sources: ManualAgentSource[];
   voiceLine: string;
 }
 
@@ -97,6 +100,14 @@ export interface ManualCoachInput {
   shoulderView: string;
   shoulderSlopeDegrees: number;
   feedbackIds: string[];
+}
+
+export interface ManualAgentSource {
+  id: string;
+  source: string;
+  title: string;
+  score: number;
+  excerpt: string;
 }
 
 const SCORING: ScoreCriterion[] = [
@@ -406,15 +417,309 @@ const BREASTSTROKE: StrokeKnowledgeBase = {
   scoring: SCORING,
 };
 
+const BUTTERFLY: StrokeKnowledgeBase = {
+  identifier: "STROKE_ANALYSIS_CURRICULUM_V1:BUTTERFLY",
+  stroke: "Butterfly",
+  displayName: "Butterfly",
+  phases: [
+    {
+      id: "beginner",
+      label: "Beginner",
+      levels: "Ultra 1-3",
+      objective: "Build body dolphin, balanced recovery, and a low breath.",
+      rubric: [
+        { skill: "Body Line", weight: 30, cue: "Long body with chest press and hips following." },
+        { skill: "Dolphin Kick", weight: 30, cue: "Kick from the core with relaxed ankles." },
+        { skill: "Arm Recovery", weight: 20, cue: "Both arms recover together over the surface." },
+        { skill: "Breathing", weight: 20, cue: "Breathe low and return eyes down quickly." },
+      ],
+    },
+    {
+      id: "intermediate",
+      label: "Intermediate",
+      levels: "Ultra 4-6",
+      objective: "Coordinate catch, breath, and two-kick rhythm without pausing.",
+      rubric: [
+        { skill: "Catch Timing", weight: 30, cue: "Hands anchor before the breath lifts." },
+        { skill: "Two-Kick Rhythm", weight: 25, cue: "One kick on entry, one kick through the press." },
+        { skill: "Recovery", weight: 25, cue: "Wide relaxed recovery with soft elbows." },
+        { skill: "Timing", weight: 20, cue: "No dead spot between entry and catch." },
+      ],
+    },
+    {
+      id: "advanced",
+      label: "Advanced",
+      levels: "Ultra 7-9",
+      objective: "Hold a powerful early catch with continuous undulation at speed.",
+      rubric: [
+        { skill: "High Catch", weight: 30, cue: "Forearms tip down before the press." },
+        { skill: "Core Timing", weight: 30, cue: "Chest press, hips rise, kick finishes the pull." },
+        { skill: "Symmetry", weight: 20, cue: "Both arms recover and enter together." },
+        { skill: "Breathing Precision", weight: 20, cue: "Breath stays low without breaking rhythm." },
+      ],
+    },
+  ],
+  flawCorrections: [
+    {
+      problem: "Flat body line or sinking hips",
+      drill: "Body Dolphin / Chest Press",
+      logic: "Teaches the wave from chest to hips before adding arm load.",
+      tags: ["body-line", "kick"],
+    },
+    {
+      problem: "Weak catch or slipping press",
+      drill: "Single-Arm Butterfly",
+      logic: "Isolates early catch pressure while the other arm stays forward.",
+      tags: ["catch", "elbow", "underwater-drive"],
+    },
+    {
+      problem: "Arms recovering unevenly",
+      drill: "3-3-3 Butterfly",
+      logic: "Alternates single-arm and full-stroke fly to rebuild symmetry.",
+      tags: ["rotation", "recovery", "timing"],
+    },
+    {
+      problem: "Late breath or lifted head",
+      drill: "No-Breath Butterfly / Low Breath",
+      logic: "Keeps the head low so the body wave continues forward.",
+      tags: ["breathing", "body-line"],
+    },
+    {
+      problem: "Broken two-kick rhythm",
+      drill: "Dolphin Kick + One Pull",
+      logic: "Links entry kick and press kick before full-stroke speed.",
+      tags: ["timing", "kick"],
+    },
+  ],
+  drills: [
+    { name: "Body Dolphin", description: "Arms extended, chest presses down, hips follow.", purpose: "Build undulation rhythm." },
+    { name: "Chest Press", description: "Small dolphin motion led by sternum pressure.", purpose: "Keep fly forward instead of vertical." },
+    { name: "Single-Arm Butterfly", description: "One arm pulls while the other stays forward.", purpose: "Catch pressure and breath timing." },
+    { name: "3-3-3 Butterfly", description: "Three right-arm, three left-arm, three full strokes.", purpose: "Symmetry and rhythm transfer." },
+    { name: "Dolphin Kick + One Pull", description: "Several dolphin kicks into one controlled fly pull.", purpose: "Two-kick timing." },
+  ],
+  scoring: SCORING,
+};
+
 const KNOWLEDGE_BASES: Record<ManualStroke, StrokeKnowledgeBase> = {
   Freestyle: FRONT_CRAWL,
   Backstroke: BACKSTROKE,
+  Butterfly: BUTTERFLY,
   Breaststroke: BREASTSTROKE,
 };
+
+type ManualAgentChunkKind = "phase" | "correction" | "drill" | "score";
+
+interface ManualAgentChunk {
+  id: string;
+  source: string;
+  stroke: ManualStroke;
+  kind: ManualAgentChunkKind;
+  title: string;
+  text: string;
+  tags: string[];
+  correction?: FlawCorrection;
+}
+
+interface PhoneAgentContext {
+  query: string;
+  tags: string[];
+  chunks: ManualAgentChunk[];
+  sources: ManualAgentSource[];
+}
+
+function buildManualAgentChunks(kb: StrokeKnowledgeBase): ManualAgentChunk[] {
+  const chunks: ManualAgentChunk[] = [];
+
+  for (const phase of kb.phases) {
+    chunks.push({
+      id: `${kb.stroke.toLowerCase()}-${phase.id}`,
+      source: `${kb.identifier}:${phase.id.toUpperCase()}`,
+      stroke: kb.stroke,
+      kind: "phase",
+      title: `${kb.displayName} ${phase.label}`,
+      text: [
+        phase.objective,
+        phase.levels,
+        ...phase.rubric.map((item) => `${item.skill}: ${item.cue}`),
+      ].join(" "),
+      tags: phase.rubric.map((item) => item.skill.toLowerCase()),
+    });
+  }
+
+  kb.flawCorrections.forEach((correction, index) => {
+    chunks.push({
+      id: `${kb.stroke.toLowerCase()}-correction-${index + 1}`,
+      source: `${kb.identifier}:CORRECTION-${index + 1}`,
+      stroke: kb.stroke,
+      kind: "correction",
+      title: correction.problem,
+      text: `${correction.problem}. Drill: ${correction.drill}. Logic: ${correction.logic}. Tags: ${correction.tags.join(" ")}.`,
+      tags: correction.tags,
+      correction,
+    });
+  });
+
+  kb.drills.forEach((drill, index) => {
+    chunks.push({
+      id: `${kb.stroke.toLowerCase()}-drill-${index + 1}`,
+      source: `${kb.identifier}:DRILL-${index + 1}`,
+      stroke: kb.stroke,
+      kind: "drill",
+      title: drill.name,
+      text: `${drill.name}. ${drill.description} Purpose: ${drill.purpose}.`,
+      tags: [drill.name.toLowerCase(), drill.purpose.toLowerCase()],
+    });
+  });
+
+  kb.scoring.forEach((score) => {
+    chunks.push({
+      id: `${kb.stroke.toLowerCase()}-score-${score.score}`,
+      source: `${kb.identifier}:SCORE-${score.score}`,
+      stroke: kb.stroke,
+      kind: "score",
+      title: `${score.score}/5 ${score.label}`,
+      text: `${score.label}. ${score.description}`,
+      tags: [score.label.toLowerCase(), "score", String(score.score)],
+    });
+  });
+
+  return chunks;
+}
+
+const PHONE_AGENT_CHUNKS: Record<ManualStroke, ManualAgentChunk[]> = {
+  Freestyle: buildManualAgentChunks(FRONT_CRAWL),
+  Backstroke: buildManualAgentChunks(BACKSTROKE),
+  Butterfly: buildManualAgentChunks(BUTTERFLY),
+  Breaststroke: buildManualAgentChunks(BREASTSTROKE),
+};
+
+function tokenize(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9]+/g)?.filter((word) => word.length > 2) ?? [];
+}
+
+function keywordScore(query: string, text: string): number {
+  const queryTerms = tokenize(query);
+  if (queryTerms.length === 0) return 0;
+
+  const frequencies = new Map<string, number>();
+  const textTerms = tokenize(text);
+  for (const term of textTerms) {
+    frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
+  }
+
+  let score = 0;
+  for (const term of queryTerms) {
+    score += Math.log(1 + (frequencies.get(term) ?? 0));
+  }
+
+  return score / Math.sqrt(Math.max(1, textTerms.length));
+}
+
+function buildPhoneAgentTags(input: ManualCoachInput, kb: StrokeKnowledgeBase): string[] {
+  const tags = new Set<string>([kb.stroke.toLowerCase(), "score"]);
+
+  if (input.trackingQuality < 0.45 || input.edgeLandmarks >= 2) {
+    tags.add("body-line");
+    tags.add("camera");
+  }
+  if (input.catchPhaseActive && !input.anyEvf) {
+    tags.add("catch");
+    tags.add("elbow");
+  }
+  if (hasFeedback(input, "left-dropped-elbow") || hasFeedback(input, "right-dropped-elbow")) {
+    tags.add("elbow");
+    tags.add("catch");
+  }
+  if (
+    hasFeedback(input, "shoulder-tilt") ||
+    input.shoulderSlopeDegrees > 18 ||
+    input.shoulderView === "side"
+  ) {
+    tags.add(kb.stroke === "Breaststroke" ? "body-line" : "rotation");
+  }
+  if (hasFeedback(input, "left-cross") || hasFeedback(input, "right-cross")) {
+    tags.add("centerline");
+    tags.add("recovery");
+  }
+  if (input.lockState === "acquiring" || input.confidence < 0.52) {
+    tags.add("timing");
+  }
+  if (input.anyEvf) {
+    tags.add("catch");
+    tags.add("underwater-drive");
+  }
+
+  return [...tags];
+}
+
+function buildPhoneAgentQuery(input: ManualCoachInput, kb: StrokeKnowledgeBase, tags: string[]): string {
+  return [
+    kb.displayName,
+    input.stroke,
+    input.strokeFocus,
+    input.lockState,
+    input.shoulderView,
+    ...tags,
+    ...input.feedbackIds,
+    input.anyEvf ? "strong catch evf" : "needs technique correction",
+    input.catchPhaseActive ? "catch phase active" : "setup phase",
+  ].join(" ");
+}
+
+function retrievePhoneAgentChunks(
+  input: ManualCoachInput,
+  kb: StrokeKnowledgeBase
+): PhoneAgentContext {
+  const tags = buildPhoneAgentTags(input, kb);
+  const query = buildPhoneAgentQuery(input, kb, tags);
+  const chunks = PHONE_AGENT_CHUNKS[kb.stroke]
+    .map((chunk) => {
+      const tagBoost =
+        chunk.tags.filter((tag) =>
+          tags.some((inputTag) => tag.includes(inputTag) || inputTag.includes(tag))
+        ).length * 0.18;
+      const correctionBoost = chunk.kind === "correction" ? 0.16 : 0;
+      return {
+        chunk,
+        score: keywordScore(query, chunk.text) + tagBoost + correctionBoost,
+      };
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5);
+
+  return {
+    query,
+    tags,
+    chunks: chunks.map((item) => item.chunk),
+    sources: chunks.map((item) => ({
+      id: item.chunk.id,
+      source: item.chunk.source,
+      title: item.chunk.title,
+      score: Math.round(item.score * 100),
+      excerpt: item.chunk.text.length > 132
+        ? `${item.chunk.text.slice(0, 129).trim()}...`
+        : item.chunk.text,
+    })),
+  };
+}
+
+function correctionFromAgent(
+  kb: StrokeKnowledgeBase,
+  context: PhoneAgentContext,
+  tag: string
+): FlawCorrection {
+  return (
+    context.chunks.find(
+      (chunk) => chunk.correction && chunk.tags.some((item) => item === tag || item.includes(tag))
+    )?.correction ?? findCorrection(kb, tag)
+  );
+}
 
 function strokeFromLabel(value: string): ManualStroke | null {
   if (value === "Freestyle" || value === "Front Crawl") return "Freestyle";
   if (value === "Backstroke" || value === "Backcrawl") return "Backstroke";
+  if (value === "Butterfly") return "Butterfly";
   if (value === "Breaststroke") return "Breaststroke";
   return null;
 }
@@ -730,6 +1035,31 @@ function buildNextSet(
     };
   }
 
+  if (kb.stroke === "Butterfly") {
+    if (comment.id.includes("catch") || comment.id.includes("elbow")) {
+      return {
+        title: "Catch And Press",
+        reps: "4 x 15m",
+        instruction: "Use Single-Arm Butterfly, then two easy full strokes with forearms tipping down before the press.",
+        successMetric: "Catch pressure appears before the breath or head lift.",
+      };
+    }
+    if (comment.id.includes("timing") || comment.id.includes("kick")) {
+      return {
+        title: "Two-Kick Timing",
+        reps: "4 x 15m",
+        instruction: "Use Dolphin Kick + One Pull and feel one kick on entry, one kick through the press.",
+        successMetric: "The stroke keeps moving with no pause after hand entry.",
+      };
+    }
+    return {
+      title: "Body Wave Reset",
+      reps: "4 x 15m",
+      instruction: "Use Body Dolphin into 3-3-3 Butterfly, keeping the breath low and arms symmetrical.",
+      successMetric: "Hips follow the chest press and both hands recover together.",
+    };
+  }
+
   if (comment.id.includes("catch") || comment.id.includes("elbow")) {
     return {
       title: "Feel Then Swim",
@@ -771,12 +1101,16 @@ function buildNextSet(
   };
 }
 
-function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): ManualCoachComment[] {
+function buildComments(
+  input: ManualCoachInput,
+  kb: StrokeKnowledgeBase,
+  context: PhoneAgentContext
+): ManualCoachComment[] {
   const comments: ManualCoachComment[] = [];
-  const source = kb.identifier;
+  const source = context.sources[0]?.source ?? kb.identifier;
 
   if (input.trackingQuality < 0.45 || input.edgeLandmarks >= 2) {
-    const correction = findCorrection(kb, "body-line");
+    const correction = correctionFromAgent(kb, context, "body-line");
     comments.push({
       id: "camera-body-line",
       tone: "warning",
@@ -793,7 +1127,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (input.catchPhaseActive && !input.anyEvf) {
-    const correction = findCorrection(kb, "catch");
+    const correction = correctionFromAgent(kb, context, "catch");
     comments.push(
       commentFromCorrection(
         "weak-catch",
@@ -810,7 +1144,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (hasFeedback(input, "left-dropped-elbow") || hasFeedback(input, "right-dropped-elbow")) {
-    const correction = findCorrection(kb, "elbow");
+    const correction = correctionFromAgent(kb, context, "elbow");
     comments.push(
       commentFromCorrection(
         "dropped-elbow",
@@ -829,7 +1163,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
     input.shoulderSlopeDegrees > 18 ||
     input.shoulderView === "side"
   ) {
-    const correction = findCorrection(kb, "rotation");
+    const correction = correctionFromAgent(kb, context, "rotation");
     comments.push(
       commentFromCorrection(
         "rotation",
@@ -848,7 +1182,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (hasFeedback(input, "left-cross") || hasFeedback(input, "right-cross")) {
-    const correction = findCorrection(kb, "centerline");
+    const correction = correctionFromAgent(kb, context, "centerline");
     comments.push(
       commentFromCorrection(
         "centerline-cross",
@@ -863,7 +1197,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (input.lockState === "acquiring" || input.confidence < 0.52) {
-    const correction = findCorrection(kb, "timing");
+    const correction = correctionFromAgent(kb, context, "timing");
     comments.push(
       commentFromCorrection(
         "timing",
@@ -880,7 +1214,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (input.anyEvf && comments.length === 0) {
-    const correction = findCorrection(kb, "catch");
+    const correction = correctionFromAgent(kb, context, "catch");
     comments.push({
       id: "strong-catch",
       tone: "good",
@@ -894,7 +1228,7 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   }
 
   if (comments.length === 0) {
-    const correction = findCorrection(kb, "body-line");
+    const correction = correctionFromAgent(kb, context, "body-line");
     comments.push({
       id: "steady-style",
       tone: "good",
@@ -912,33 +1246,50 @@ function buildComments(input: ManualCoachInput, kb: StrokeKnowledgeBase): Manual
   );
 }
 
-export function evaluateSwimStyleCoach(input: ManualCoachInput): ManualCoachResult {
+function buildLiveCue(comment: ManualCoachComment, input: ManualCoachInput): string {
+  if (input.trackingQuality < 0.45) {
+    return comment.immediateCue ?? "Move the phone back until one full arm chain is visible.";
+  }
+
+  if (comment.immediateCue) return comment.immediateCue;
+  return comment.comment;
+}
+
+export function evaluatePhoneSwimAgent(input: ManualCoachInput): ManualCoachResult {
   const kb = selectKnowledgeBase(input);
+  const context = retrievePhoneAgentChunks(input, kb);
   const phase = estimatePhase(input, kb);
   const estimatedScore = estimateScore(input, kb);
   const rubric = buildRubric(input, phase, kb);
-  const comments = buildComments(input, kb).slice(0, 1);
+  const comments = buildComments(input, kb, context).slice(0, 2);
   const first = firstActionableComment(comments);
   const nextSet = buildNextSet(input, kb, phase, first);
 
   return {
-    model: "stroke-manual-reasoner-v3",
+    model: "glide-phone-manual-agent-v1",
+    agentMode: "phone-local-keyword-rag",
     stroke: kb.stroke,
     strokeLabel: kb.displayName,
     phase,
     estimatedScore,
     confidence: coachConfidence(input, kb),
+    liveCue: buildLiveCue(first, input),
     primaryFocus: inferPrimaryFocus(first, phase),
     inferredCause: inferCause(input, kb, phase, first),
     nextSet,
     rubric,
     comments,
+    sources: context.sources,
     voiceLine: first.drill
       ? `${first.title}. ${first.immediateCue ?? first.comment} Try ${first.drill}.`
       : `${first.title}. ${first.immediateCue ?? first.comment}`,
   };
 }
 
+export function evaluateSwimStyleCoach(input: ManualCoachInput): ManualCoachResult {
+  return evaluatePhoneSwimAgent(input);
+}
+
 export function evaluateFrontCrawlCoach(input: ManualCoachInput): ManualCoachResult {
-  return evaluateSwimStyleCoach({ ...input, strokeFocus: "Freestyle" });
+  return evaluatePhoneSwimAgent({ ...input, strokeFocus: "Freestyle" });
 }
