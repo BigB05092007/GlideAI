@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">GlideAI</string>
+    <string name="title_activity_main">GlideAI</string>
+    <string name="package_name">com.glideai.mobile</string>
+    <string name="custom_url_scheme">com.glideai.mobile</string>
+</resources>

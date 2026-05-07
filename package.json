@@ -22,12 +22,18 @@
     "ios:prepare": "npm run build:static && cap sync ios",
     "ios:add": "cap add ios",
     "ios:open": "cap open ios",
+    "android:prepare": "npm run build:static && cap sync android",
+    "android:add": "cap add android",
+    "android:open": "cap open android",
+    "android:run": "npm run android:prepare && cap run android",
+    "android:build": "npm run android:prepare && cd android && gradlew assembleDebug",
     "electron:dev": "concurrently -k \"cross-env BROWSER=none next dev\" \"wait-on http://127.0.0.1:3000 && cross-env ELECTRON_DEV=1 electron .\"",
     "build:electron": "cross-env ELECTRON_BUILD=1 next build",
     "electron:pack": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
     "electron:dir": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win dir"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.1",
     "@capacitor/core": "^8.3.1",
     "@capacitor/ios": "^8.3.1",
     "@mediapipe/camera_utils": "^0.3.1675466862",
