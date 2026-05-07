@@ -436,9 +436,9 @@ const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
   showSkeleton: true,
   showJoints: true,
   showTrails: true,
-  showCoachCues: true,
-  mirrored: true,
-  cameraFacingMode: "user",
+  showCoachCues: false,
+  mirrored: false,
+  cameraFacingMode: "environment",
   overlayOpacity: 0.9,
 };
 const DEFAULT_SWIMMER_PROFILE: SwimmerProfile = {
@@ -5431,7 +5431,7 @@ export default function AnalysisEngine({
             videoConstraints={{
               width: { ideal: VIDEO_WIDTH },
               height: { ideal: VIDEO_HEIGHT },
-              facingMode: { ideal: trackerSettings.cameraFacingMode },
+              facingMode: trackerSettings.cameraFacingMode,
             }}
             onUserMedia={() => {
               setCameraError(null);

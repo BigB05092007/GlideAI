@@ -917,7 +917,7 @@ export function evaluateSwimStyleCoach(input: ManualCoachInput): ManualCoachResu
   const phase = estimatePhase(input, kb);
   const estimatedScore = estimateScore(input, kb);
   const rubric = buildRubric(input, phase, kb);
-  const comments = buildComments(input, kb).slice(0, 3);
+  const comments = buildComments(input, kb).slice(0, 1);
   const first = firstActionableComment(comments);
   const nextSet = buildNextSet(input, kb, phase, first);
 
