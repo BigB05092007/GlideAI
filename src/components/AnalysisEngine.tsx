@@ -77,12 +77,19 @@ type ArmSide = "left" | "right";
 type PredictionMode = "off" | "assist" | "extended";
 type CameraViewMode = "auto" | "top" | "side" | "top-side" | "front";
 type CameraFacingMode = "user" | "environment";
+type CameraFallbackMode = "selected" | "alternate" | "any";
 type AnalysisView = Exclude<CameraViewMode, "auto"> | "unknown";
 type TrackingState = "live" | "limited" | "predicting" | "lost";
 type InterfaceStyle = "pro" | "pool" | "contrast";
 type PanelView = "dashboard" | "coach" | "settings" | "history";
 type SuggestionTone = "good" | "warning" | "critical";
 type VoiceStatus = "ready" | "speaking" | "blocked" | "unsupported";
+
+const CAMERA_FALLBACK_MODES: readonly CameraFallbackMode[] = [
+  "selected",
+  "alternate",
+  "any",
+];
 
 type StrokeType =
   | "Freestyle"
@@ -822,6 +829,43 @@ function cameraErrorMessage(error: unknown): string {
   }
 
   return message || fallback;
+}
+
+function isRecoverableCameraStartupError(error: unknown): boolean {
+  const name = error instanceof DOMException ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error || "");
+  const normalized = `${name} ${message}`.toLowerCase();
+
+  return (
+    name === "NotReadableError" ||
+    name === "OverconstrainedError" ||
+    normalized.includes("could not start") ||
+    normalized.includes("constraint")
+  );
+}
+
+function cameraVideoConstraints(
+  preferredFacingMode: CameraFacingMode,
+  fallbackMode: CameraFallbackMode
+): MediaTrackConstraints {
+  const base: MediaTrackConstraints = {
+    width: { ideal: 640 },
+    height: { ideal: 480 },
+  };
+
+  if (fallbackMode === "any") return base;
+
+  const facingMode =
+    fallbackMode === "alternate"
+      ? preferredFacingMode === "environment"
+        ? "user"
+        : "environment"
+      : preferredFacingMode;
+
+  return {
+    ...base,
+    facingMode: { ideal: facingMode },
+  };
 }
 
 function appAssetUrl(path: string): string {
@@ -5051,7 +5095,10 @@ export default function AnalysisEngine({
   const [isLoaded, setIsLoaded] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryKey, setCameraRetryKey] = useState(0);
+  const [cameraFallbackIndex, setCameraFallbackIndex] = useState(0);
   const [cameraApiSupported, setCameraApiSupported] = useState(true);
+  const cameraFallbackMode =
+    CAMERA_FALLBACK_MODES[cameraFallbackIndex] ?? CAMERA_FALLBACK_MODES[0];
 
   const resetTrackingMemory = useCallback(() => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
@@ -5095,6 +5142,8 @@ export default function AnalysisEngine({
       if (cameraFacingChanged) {
         setCameraReady(false);
         setVideoStreamReady(false);
+        setIsLoaded(false);
+        setCameraFallbackIndex(0);
         setCameraRetryKey((key) => key + 1);
       }
     },
@@ -5137,6 +5186,7 @@ export default function AnalysisEngine({
     setCameraReady(false);
     setVideoStreamReady(false);
     setIsLoaded(false);
+    setCameraFallbackIndex(0);
     setCameraRetryKey((key) => key + 1);
   }, []);
 
@@ -5538,17 +5588,29 @@ export default function AnalysisEngine({
             audio={false}
             mirrored={trackerSettings.mirrored}
             className="relative z-0 w-full h-full object-cover"
-            videoConstraints={{
-              width: { ideal: 640 },
-              height: { ideal: 480 },
-              facingMode: trackerSettings.cameraFacingMode,
-            }}
+            videoConstraints={cameraVideoConstraints(
+              trackerSettings.cameraFacingMode,
+              cameraFallbackMode
+            )}
             onUserMedia={() => {
               setCameraError(null);
               setVideoStreamReady(true);
             }}
             onUserMediaError={(error) => {
               setVideoStreamReady(false);
+              setCameraReady(false);
+              setIsLoaded(false);
+
+              if (
+                isRecoverableCameraStartupError(error) &&
+                cameraFallbackIndex < CAMERA_FALLBACK_MODES.length - 1
+              ) {
+                setCameraFallbackIndex((index) => index + 1);
+                setCameraError("Camera source could not start. Trying another camera mode...");
+                setCameraRetryKey((key) => key + 1);
+                return;
+              }
+
               setCameraError(cameraErrorMessage(error));
             }}
           />
