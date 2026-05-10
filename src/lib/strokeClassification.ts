@@ -25,9 +25,11 @@ const LM = {
   R_ANK: 28,
 } as const;
 
-const PARTIAL_VIS = 0.22;
+const PARTIAL_VIS = 0.14;
 const MIN_ALIGNED = 18;
 const TEMPERATURE = 0.88;
+const LONG_RANGE_SHOULDER_NORM = 0.028;
+const BASE_SHOULDER_NORM = 0.08;
 
 export interface Point2 {
   x: number;
@@ -153,6 +155,14 @@ function fuseBelief(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function shoulderNorm(shoulders: ShoulderInput): number {
+  return Math.max(shoulders.width, LONG_RANGE_SHOULDER_NORM);
+}
+
+function scaleByShoulder(value: number, shoulders: ShoulderInput, minFactor = 0.32): number {
+  return value * clamp(shoulderNorm(shoulders) / BASE_SHOULDER_NORM, minFactor, 1);
 }
 
 function landmarkVisible(lm: LandmarkInput | undefined, t = PARTIAL_VIS): lm is LandmarkInput {
@@ -336,7 +346,7 @@ function wristsHigherThanElbows(
   rw: LandmarkInput,
   le: LandmarkInput,
   re: LandmarkInput,
-  margin = 0.012
+  margin = 0.006
 ): boolean {
   const wristY = (lw.y + rw.y) / 2;
   const elbowY = (le.y + re.y) / 2;
@@ -357,7 +367,7 @@ function geometrySnapshot(
   const rw = lm[LM.R_WR];
   const le = lm[LM.L_EL];
   const re = lm[LM.R_EL];
-  const shoulderWidth = Math.max(shoulders.width, 0.078);
+  const shoulderWidth = shoulderNorm(shoulders);
   let flyRecovery = 0;
   let breastSweep = 0;
   let symPair = 0;
@@ -424,7 +434,7 @@ function lowerBodySnapshot(lm: LandmarkInput[], shoulders: ShoulderInput): {
   if (landmarkVisible(la) && landmarkVisible(ra)) {
     const ankleYDelta = Math.abs(la.y - ra.y);
     const ankleXDelta = Math.abs(la.x - ra.x);
-    const scale = Math.max(shoulders.width, 0.08);
+    const scale = shoulderNorm(shoulders);
     kickAlternating = clamp((ankleYDelta / (scale * 1.8)) + (ankleXDelta / (scale * 3.8)), 0, 1);
     kickSymmetric = 1 - clamp((ankleYDelta / (scale * 2.2)) + (ankleXDelta / (scale * 4.4)), 0, 1);
   }
@@ -433,7 +443,7 @@ function lowerBodySnapshot(lm: LandmarkInput[], shoulders: ShoulderInput): {
     const leftKneeToAnkle = Math.abs(lk.y - la.y);
     const rightKneeToAnkle = Math.abs(rk.y - ra.y);
     const diffFlex = Math.abs(leftKneeToAnkle - rightKneeToAnkle);
-    const base = Math.max(leftKneeToAnkle + rightKneeToAnkle, 0.03);
+    const base = Math.max(leftKneeToAnkle + rightKneeToAnkle, LONG_RANGE_SHOULDER_NORM);
     kneeFlexSync = clamp(1 - diffFlex / base, 0, 1);
   }
 
@@ -442,7 +452,7 @@ function lowerBodySnapshot(lm: LandmarkInput[], shoulders: ShoulderInput): {
     const hipDy = Math.abs(lh.y - rh.y);
     const shoulderDx = Math.abs(ls.x - rs.x);
     const hipDx = Math.abs(lh.x - rh.x);
-    const norm = Math.max(shoulderDx + hipDx, 0.06);
+    const norm = Math.max(shoulderDx + hipDx, LONG_RANGE_SHOULDER_NORM);
     bodyRoll = clamp((shoulderDy + hipDy) / norm, 0, 1);
 
     const shCenterY = (ls.y + rs.y) / 2;
@@ -451,7 +461,11 @@ function lowerBodySnapshot(lm: LandmarkInput[], shoulders: ShoulderInput): {
     const hipCenterX = (lh.x + rh.x) / 2;
     const torsoDy = Math.abs(shCenterY - hipCenterY);
     const torsoDx = Math.abs(shCenterX - hipCenterX);
-    trunkHorizontal = clamp(torsoDx / Math.max(torsoDy + torsoDx, 0.03), 0, 1);
+    trunkHorizontal = clamp(
+      torsoDx / Math.max(torsoDy + torsoDx, LONG_RANGE_SHOULDER_NORM),
+      0,
+      1
+    );
   }
 
   return { kickAlternating, kickSymmetric, kneeFlexSync, bodyRoll, trunkHorizontal };
@@ -569,11 +583,15 @@ export function classifySwimStroke(
     const sideArm = primaryArm ?? "left";
     const pm = motion[sideArm === "left" ? "left" : "right"];
     const samplesOk = pm.samples >= 10;
-    const strokeMotion = samplesOk && (pm.rangeX > 0.052 || pm.rangeY > 0.052);
+    const sideMotionThreshold = scaleByShoulder(0.052, shoulders, 0.26);
+    const sideTravelThreshold = scaleByShoulder(0.1, shoulders, 0.28);
+    const strokeMotion =
+      samplesOk &&
+      (pm.rangeX > sideMotionThreshold || pm.rangeY > sideMotionThreshold);
     const lowEvidence =
       !strokeMotion ||
       partialArmCount < 2 ||
-      bilateralTravel < 0.1;
+      bilateralTravel < sideTravelThreshold;
     if (lowEvidence) {
       return {
         stroke: "Unknown",
@@ -628,7 +646,11 @@ export function classifySwimStroke(
   rhoBlend = rhoBlend * (1 - altDrive * 0.38) - altDrive * 0.22;
 
   const syncCue = clamp((rhoBlend + 1) / 2, 0, 1);
-  const spread = dualAxisSpread(motionHistory.leftWrist, motionHistory.rightWrist, Math.max(shoulders.width, 0.08));
+  const spread = dualAxisSpread(
+    motionHistory.leftWrist,
+    motionHistory.rightWrist,
+    shoulderNorm(shoulders)
+  );
 
   const geo = geometrySnapshot(lm, shoulders);
   const lower = lowerBodySnapshot(lm, shoulders);
@@ -636,9 +658,9 @@ export function classifySwimStroke(
   const hasSolidMotion =
     motion.left.samples >= 12 &&
     motion.right.samples >= 12 &&
-    leftTravel > 0.032 &&
-    rightTravel > 0.032 &&
-    bilateralTravel > 0.085;
+    leftTravel > scaleByShoulder(0.032, shoulders, 0.3) &&
+    rightTravel > scaleByShoulder(0.032, shoulders, 0.3) &&
+    bilateralTravel > scaleByShoulder(0.085, shoulders, 0.3);
 
   const pairedOk = paired !== null;
 

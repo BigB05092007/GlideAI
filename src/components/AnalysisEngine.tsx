@@ -315,6 +315,24 @@ interface LandmarkTrack {
   missingFrames: number;
 }
 
+interface PoseInputTransform {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface PoseFrameInput {
+  image: HTMLVideoElement | HTMLCanvasElement;
+  transform: PoseInputTransform;
+}
+
+interface LongRangeProcessingState {
+  canvas: HTMLCanvasElement | null;
+  transform: PoseInputTransform;
+  scanIndex: number;
+}
+
 type PoseConnection = readonly [number, number];
 type LandmarkTrackingMemory = Array<LandmarkTrack | null>;
 type CatchAxis = "x" | "y";
@@ -375,7 +393,7 @@ interface ProfileGeometry {
 interface PoseInstance {
   setOptions: (o: Record<string, unknown>) => void;
   onResults: (cb: (r: Results) => void) => void;
-  send: (input: { image: HTMLVideoElement }) => Promise<unknown>;
+  send: (input: { image: HTMLVideoElement | HTMLCanvasElement }) => Promise<unknown>;
   close: () => void;
   initialize?: () => Promise<void>;
 }
@@ -391,10 +409,10 @@ const CATCH_PHASE_THRESHOLD = 0.3;
 const CATCH_PHASE_EDGE_THRESHOLD = 0.28;
 const STROKE_RANGE_DECAY = 0.0025;
 const LANDMARK_SMOOTHING_ALPHA = 0.34;
-const LANDMARK_RELIABLE_VISIBILITY = 0.5;
-const LANDMARK_PARTIAL_VISIBILITY = 0.22;
-const LANDMARK_DRAW_VISIBILITY = 0.24;
-const HAND_PROXY_VISIBILITY = 0.34;
+const LANDMARK_RELIABLE_VISIBILITY = 0.35;
+const LANDMARK_PARTIAL_VISIBILITY = 0.14;
+const LANDMARK_DRAW_VISIBILITY = 0.16;
+const HAND_PROXY_VISIBILITY = 0.24;
 const LOW_CONFIDENCE_JUMP_LIMIT = 0.11;
 const RELIABLE_JUMP_LIMIT = 0.24;
 const ASSIST_PREDICTION_HOLD_FRAMES = 8;
@@ -411,8 +429,8 @@ const STRONG_STYLE_SAMPLE_MIN = 16;
 const STROKE_ACQUIRE_CHECKS = 2;
 const STROKE_SWITCH_CHECKS = 4;
 const STROKE_MEMORY_HOLD_CHECKS = 5;
-const MIN_STYLE_SAMPLE_QUALITY = 0.52;
-const MIN_STYLE_SAMPLE_CONFIDENCE = 0.42;
+const MIN_STYLE_SAMPLE_QUALITY = 0.42;
+const MIN_STYLE_SAMPLE_CONFIDENCE = 0.34;
 const ACTIVE_ARM_ACQUIRE_FRAMES = 8;
 const ACTIVE_ARM_SWITCH_FRAMES = 48;
 const ACTIVE_ARM_HOLD_FRAMES = 45;
@@ -424,7 +442,9 @@ const MIN_ARM_SIGNAL_SCORE = 0.62;
 const SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD = 0.06;
 const SINGLE_SHOULDER_SIDE_SCORE_MARGIN = 0.5;
 const ACTIVE_ARM_SWITCH_SCORE_MARGIN = 1.25;
-const ARM_SEGMENT_MIN = 0.015;
+const ARM_SEGMENT_MIN = 0.005;
+const LONG_RANGE_BODY_MIN = 0.02;
+const ARM_LENGTH_QUALITY_REFERENCE = 0.032;
 const FOREARM_SEGMENT_MAX = 0.58;
 const UPPER_ARM_SEGMENT_MAX = 0.52;
 const ARM_RATIO_MIN = 0.25;
@@ -432,7 +452,7 @@ const ARM_RATIO_MAX = 3.4;
 const ANGLE_SMOOTHING_ALPHA = 0.34;
 const ANGLE_MAX_STEP_DEGREES = 9;
 const ANGLE_HOLD_FRAMES = 5;
-const MIN_ANGLE_CONFIDENCE = 0.35;
+const MIN_ANGLE_CONFIDENCE = 0.22;
 const VOICE_CUE_COOLDOWN_MS = 15000;
 const VIDEO_WIDTH = 960;
 const VIDEO_HEIGHT = 540;
@@ -441,6 +461,23 @@ const DEFAULT_LIMB = "rgba(0, 200, 255, 0.55)";
 const DEFAULT_JOINT = "rgba(255, 255, 255, 0.85)";
 const SHOULDER_LINE = "rgba(250, 204, 21, 0.95)";
 const POSE_ASSET_PATH = "vendor/mediapipe/pose/";
+const FULL_POSE_INPUT_TRANSFORM: PoseInputTransform = Object.freeze({
+  x: 0,
+  y: 0,
+  width: 1,
+  height: 1,
+});
+const LONG_RANGE_INPUT_MAX_WIDTH = 1280;
+const LONG_RANGE_INPUT_MAX_HEIGHT = 720;
+const LONG_RANGE_FULL_SCAN_EVERY = 5;
+const LONG_RANGE_SCAN_CROP_SIZE = 0.46;
+const LONG_RANGE_CENTER_SCAN_CROP_SIZE = 0.64;
+const LONG_RANGE_MIN_LOCK_CROP = 0.16;
+const LONG_RANGE_MAX_LOCK_CROP = 0.74;
+const LONG_RANGE_LOCK_PADDING = 3.1;
+const LONG_RANGE_TRACK_BLEND = 0.32;
+const LONG_RANGE_REACQUIRE_HOLD_FRAMES = 36;
+const MIN_CATCH_RANGE = 0.004;
 const DEFAULT_TRACKER_SETTINGS: TrackerSettings = {
   predictionMode: "assist",
   viewMode: "auto",
@@ -656,10 +693,10 @@ function createProfileGeometry(profile: SwimmerProfile): ProfileGeometry {
     ),
     minArmSignalScore: clamp(
       MIN_ARM_SIGNAL_SCORE + bodyMassSignalBias + influence * 0.03,
-      0.52,
+      0.44,
       0.75
     ),
-    completeArmSignalScore: clamp(1.35 + bodyMassSignalBias + influence * 0.05, 1.18, 1.5),
+    completeArmSignalScore: clamp(1.35 + bodyMassSignalBias + influence * 0.05, 0.95, 1.5),
     sideViewShoulderThreshold: clamp(
       SIDE_VIEW_SHOULDER_WIDTH_THRESHOLD * mix(1, shoulderRatio / 0.24, influence),
       0.048,
@@ -849,8 +886,9 @@ function cameraVideoConstraints(
   fallbackMode: CameraFallbackMode
 ): MediaTrackConstraints {
   const base: MediaTrackConstraints = {
-    width: { ideal: 640 },
-    height: { ideal: 480 },
+    width: { ideal: 1920 },
+    height: { ideal: 1080 },
+    frameRate: { ideal: 30 },
   };
 
   if (fallbackMode === "any") return base;
@@ -866,6 +904,196 @@ function cameraVideoConstraints(
     ...base,
     facingMode: { ideal: facingMode },
   };
+}
+
+function createLongRangeProcessingState(): LongRangeProcessingState {
+  return {
+    canvas: null,
+    transform: FULL_POSE_INPUT_TRANSFORM,
+    scanIndex: 0,
+  };
+}
+
+function isFullPoseInputTransform(transform: PoseInputTransform): boolean {
+  return (
+    transform.x === 0 &&
+    transform.y === 0 &&
+    transform.width === 1 &&
+    transform.height === 1
+  );
+}
+
+function cropAroundPoint(centerX: number, centerY: number, size: number): PoseInputTransform {
+  const width = clamp(size, 0.05, 1);
+  const height = clamp(size, 0.05, 1);
+
+  return {
+    x: clamp(centerX - width / 2, 0, 1 - width),
+    y: clamp(centerY - height / 2, 0, 1 - height),
+    width,
+    height,
+  };
+}
+
+function blendPoseInputTransform(
+  previous: PoseInputTransform,
+  next: PoseInputTransform,
+  alpha: number
+): PoseInputTransform {
+  if (isFullPoseInputTransform(previous)) return next;
+
+  return cropAroundPoint(
+    previous.x + previous.width / 2 +
+      (next.x + next.width / 2 - (previous.x + previous.width / 2)) * alpha,
+    previous.y + previous.height / 2 +
+      (next.y + next.height / 2 - (previous.y + previous.height / 2)) * alpha,
+    previous.width + (next.width - previous.width) * alpha
+  );
+}
+
+function longRangeScanTransform(state: LongRangeProcessingState): PoseInputTransform {
+  const scanStep = state.scanIndex;
+  state.scanIndex += 1;
+
+  if (scanStep % LONG_RANGE_FULL_SCAN_EVERY === 0) {
+    state.transform = FULL_POSE_INPUT_TRANSFORM;
+    return FULL_POSE_INPUT_TRANSFORM;
+  }
+
+  const centers: readonly Point[] = [
+    { x: 0.5, y: 0.5 },
+    { x: 0.25, y: 0.5 },
+    { x: 0.75, y: 0.5 },
+    { x: 0.5, y: 0.25 },
+    { x: 0.5, y: 0.75 },
+    { x: 0.25, y: 0.25 },
+    { x: 0.75, y: 0.25 },
+    { x: 0.25, y: 0.75 },
+    { x: 0.75, y: 0.75 },
+  ];
+  const fullFrameScansBefore = Math.floor(scanStep / LONG_RANGE_FULL_SCAN_EVERY);
+  const tileIndex = (scanStep - fullFrameScansBefore - 1) % centers.length;
+  const center = centers[tileIndex] ?? centers[0];
+  const size =
+    center.x === 0.5 && center.y === 0.5
+      ? LONG_RANGE_CENTER_SCAN_CROP_SIZE
+      : LONG_RANGE_SCAN_CROP_SIZE;
+
+  state.transform = cropAroundPoint(center.x, center.y, size);
+  return state.transform;
+}
+
+function trackedLongRangeTransform(
+  memory: LandmarkTrackingMemory,
+  missingFrames: number
+): PoseInputTransform | null {
+  if (missingFrames > LONG_RANGE_REACQUIRE_HOLD_FRAMES) return null;
+
+  const points: Point[] = [];
+  for (const index of SWIM_LANDMARKS) {
+    const landmark = memory[index]?.landmark;
+    if (
+      landmark &&
+      landmarkVisibility(landmark) >= LANDMARK_PARTIAL_VISIBILITY * 0.75 &&
+      !isOutsideFrame(landmark, 0.02)
+    ) {
+      points.push({ x: landmark.x, y: landmark.y });
+    }
+  }
+
+  if (points.length < 2) return null;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const span = Math.max(maxX - minX, maxY - minY, ARM_SEGMENT_MIN);
+  const minCrop = points.length >= 5 ? LONG_RANGE_MIN_LOCK_CROP : LONG_RANGE_MIN_LOCK_CROP * 1.35;
+  const cropSize = clamp(
+    span * LONG_RANGE_LOCK_PADDING,
+    minCrop,
+    LONG_RANGE_MAX_LOCK_CROP
+  );
+
+  return cropAroundPoint(centerX, centerY, cropSize);
+}
+
+function ensureLongRangeCanvas(
+  state: LongRangeProcessingState,
+  video: HTMLVideoElement
+): HTMLCanvasElement {
+  const aspect = video.videoWidth > 0 && video.videoHeight > 0
+    ? video.videoWidth / video.videoHeight
+    : VIDEO_WIDTH / VIDEO_HEIGHT;
+  let width = LONG_RANGE_INPUT_MAX_WIDTH;
+  let height = Math.round(width / Math.max(aspect, 0.1));
+
+  if (height > LONG_RANGE_INPUT_MAX_HEIGHT) {
+    height = LONG_RANGE_INPUT_MAX_HEIGHT;
+    width = Math.round(height * aspect);
+  }
+
+  const canvas = state.canvas ?? document.createElement("canvas");
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+
+  state.canvas = canvas;
+  return canvas;
+}
+
+function prepareLongRangePoseInput(
+  video: HTMLVideoElement,
+  state: LongRangeProcessingState,
+  memory: LandmarkTrackingMemory,
+  missingFrames: number
+): PoseFrameInput {
+  const trackedTransform = trackedLongRangeTransform(memory, missingFrames);
+  const transform = trackedTransform
+    ? blendPoseInputTransform(state.transform, trackedTransform, LONG_RANGE_TRACK_BLEND)
+    : longRangeScanTransform(state);
+  state.transform = transform;
+
+  if (isFullPoseInputTransform(transform)) {
+    return { image: video, transform };
+  }
+
+  const canvas = ensureLongRangeCanvas(state, video);
+  const ctx = canvas.getContext("2d");
+  if (!ctx || video.videoWidth <= 0 || video.videoHeight <= 0) {
+    return { image: video, transform: FULL_POSE_INPUT_TRANSFORM };
+  }
+
+  const sx = Math.round(transform.x * video.videoWidth);
+  const sy = Math.round(transform.y * video.videoHeight);
+  const sw = Math.max(1, Math.round(transform.width * video.videoWidth));
+  const sh = Math.max(1, Math.round(transform.height * video.videoHeight));
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+  return { image: canvas, transform };
+}
+
+function remapLongRangeLandmarks(
+  landmarks: NormalizedLandmark[],
+  transform: PoseInputTransform
+): NormalizedLandmark[] {
+  if (isFullPoseInputTransform(transform)) return landmarks;
+
+  return landmarks.map((landmark) => ({
+    ...landmark,
+    x: clamp01(transform.x + landmark.x * transform.width),
+    y: clamp01(transform.y + landmark.y * transform.height),
+    z: (landmark.z ?? 0) * Math.max(transform.width, transform.height),
+  }));
 }
 
 function appAssetUrl(path: string): string {
@@ -2105,10 +2333,14 @@ function hasTopViewSignal(
       range(armPoints.map((point) => point.x)),
       range(armPoints.map((point) => point.y))
     );
+  const longRangeScale = Math.min(
+    profileGeometry.sideViewShoulderThreshold,
+    LONG_RANGE_BODY_MIN
+  );
   const topByArmGeometry =
-    shoulderWidth >= profileGeometry.sideViewShoulderThreshold &&
+    shoulderWidth >= longRangeScale &&
     armPoints.length >= 2 &&
-    armReach > Math.max(shoulderWidth * profileGeometry.topArmReachFactor, 0.055) &&
+    armReach > Math.max(shoulderWidth * profileGeometry.topArmReachFactor, longRangeScale) &&
     armSpread > shoulderWidth * 0.45;
 
   if (!leftHip && !rightHip) {
@@ -2120,9 +2352,12 @@ function hasTopViewSignal(
 
   const hipWidth = leftHip && rightHip ? distance(leftHip, rightHip) : shoulderWidth * 0.8;
   const torsoLength = distance(shoulderCenter, hipCenter);
-  const bodyWidth = Math.max(shoulderWidth, hipWidth, 0.045);
+  const bodyWidth = Math.max(shoulderWidth, hipWidth, LONG_RANGE_BODY_MIN);
 
-  return (torsoLength > 0.055 && torsoLength > bodyWidth * 0.55) || topByArmGeometry;
+  return (
+    (torsoLength > LONG_RANGE_BODY_MIN && torsoLength > bodyWidth * 0.55) ||
+    topByArmGeometry
+  );
 }
 
 function hasSideViewSignal(
@@ -2318,7 +2553,9 @@ function getArmGeometryQuality(
   const ratioSpread =
     (profileGeometry.armRatioMax - profileGeometry.armRatioMin) / 2;
   const ratioQuality = 1 - Math.min(1, Math.abs(ratio - ratioCenter) / ratioSpread);
-  const lengthQuality = Math.min(upperArm / 0.08, 1) * 0.45 + Math.min(forearm / 0.08, 1) * 0.55;
+  const lengthQuality =
+    Math.min(upperArm / ARM_LENGTH_QUALITY_REFERENCE, 1) * 0.45 +
+    Math.min(forearm / ARM_LENGTH_QUALITY_REFERENCE, 1) * 0.55;
 
   return clamp(visibilityQuality * 0.58 + ratioQuality * 0.18 + lengthQuality * 0.24, 0, 1);
 }
@@ -2399,7 +2636,7 @@ function isInCatchWindow(
   const value = axis === "x" ? wrist.x : wrist.y;
   const rangeSize = max - min;
 
-  if (rangeSize <= 0.01) return false;
+  if (rangeSize <= MIN_CATCH_RANGE) return false;
 
   const progress = (value - min) / rangeSize;
   return allowEitherEdge
@@ -2626,7 +2863,7 @@ function getShoulderMetrics(
         view: "top",
         trackedSide: primaryArm ?? "none",
         slopeDegrees: 0,
-        width: Math.max(hipWidth, 0.1),
+        width: Math.max(hipWidth, LONG_RANGE_BODY_MIN * 1.8),
         centerX: hipCenter.x,
         centerY: hipCenter.y,
       };
@@ -2641,12 +2878,17 @@ function getShoulderMetrics(
         isVisible(elbow, LANDMARK_PARTIAL_VISIBILITY) &&
         isVisible(wrist, LANDMARK_PARTIAL_VISIBILITY)
       ) {
+        const armWidth = Math.max(
+          landmarkDistance(elbow, wrist) * 0.9,
+          LONG_RANGE_BODY_MIN * 1.8
+        );
+
         return {
           visible: true,
           view: "side",
           trackedSide: primaryArm,
           slopeDegrees: 0,
-          width: 0.12,
+          width: armWidth,
           centerX: (elbow.x + wrist.x) / 2,
           centerY: (elbow.y + wrist.y) / 2,
         };
@@ -2669,7 +2911,7 @@ function getShoulderMetrics(
       primaryArm ?? (leftVisible ? "left" : "right");
     const shoulder = leftVisible ? leftShoulder : rightShoulder;
     const hasOverheadBodyLine = Boolean(
-      hipCenter && distance({ x: shoulder.x, y: shoulder.y }, hipCenter) > 0.055
+      hipCenter && distance({ x: shoulder.x, y: shoulder.y }, hipCenter) > LONG_RANGE_BODY_MIN
     );
 
     return {
@@ -2677,7 +2919,7 @@ function getShoulderMetrics(
       view: hasOverheadBodyLine ? "top" : "side",
       trackedSide,
       slopeDegrees: 0,
-      width: Math.max(hipWidth, 0.12),
+      width: Math.max(hipWidth, LONG_RANGE_BODY_MIN * 1.8),
       centerX:
         hasOverheadBodyLine && hipCenter
           ? (shoulder.x + hipCenter.x) / 2
@@ -3409,7 +3651,7 @@ function buildCoachSuggestions(
       id: "tracking-quality",
       tone: "critical",
       title: "Detection quality",
-      detail: "Improve light, reduce splash glare, or move the camera back.",
+      detail: "Improve light, reduce splash glare, or move closer or zoom in.",
     });
   } else if (tracking.quality < 0.65) {
     suggestions.push({
@@ -5047,6 +5289,10 @@ export default function AnalysisEngine({
 }) {
   const webcamRef = useRef<Webcam>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const poseInputTransformRef = useRef<PoseInputTransform>(FULL_POSE_INPUT_TRANSFORM);
+  const longRangeProcessingRef = useRef<LongRangeProcessingState>(
+    createLongRangeProcessingState()
+  );
   const strokeRangeRef = useRef<StrokeRange>({ minX: 1, maxX: 0, minY: 1, maxY: 0 });
   const landmarkMemoryRef = useRef<LandmarkTrackingMemory>(createLandmarkTrackingMemory());
   const motionHistoryRef = useRef<MotionHistory>(createMotionHistory());
@@ -5100,7 +5346,7 @@ export default function AnalysisEngine({
   const cameraFallbackMode =
     CAMERA_FALLBACK_MODES[cameraFallbackIndex] ?? CAMERA_FALLBACK_MODES[0];
 
-  const resetTrackingMemory = useCallback(() => {
+  const resetTrackingMemory = useCallback((resetLongRangeScan = true) => {
     landmarkMemoryRef.current = createLandmarkTrackingMemory();
     motionHistoryRef.current = createMotionHistory();
     resetStrokeBelief(strokeBeliefRef.current);
@@ -5112,6 +5358,10 @@ export default function AnalysisEngine({
     lastStyleTechniqueRef.current = null;
     armIdentityMemoryRef.current = createArmIdentityMemory();
     activeArmMemoryRef.current = createActiveArmMemory();
+    poseInputTransformRef.current = FULL_POSE_INPUT_TRANSFORM;
+    if (resetLongRangeScan) {
+      longRangeProcessingRef.current = createLongRangeProcessingState();
+    }
     strokeRangeRef.current = { minX: 1, maxX: 0, minY: 1, maxY: 0 };
     lastAnalysisRef.current = null;
     lastStateUpdateRef.current = 0;
@@ -5233,7 +5483,9 @@ export default function AnalysisEngine({
     }
 
     const maxPredictionFrames = predictionHoldFrames(settings.predictionMode);
-    const rawLandmarks = results.poseLandmarks ?? null;
+    const rawLandmarks = results.poseLandmarks
+      ? remapLongRangeLandmarks(results.poseLandmarks, poseInputTransformRef.current)
+      : null;
     const roughLandmarks = rawLandmarks
       ? cleanUnstableArmGeometry(
           enhanceSwimLandmarks(rawLandmarks),
@@ -5287,7 +5539,7 @@ export default function AnalysisEngine({
 
       ctx.clearRect(0, 0, overlayMetrics.width, overlayMetrics.height);
       if (missingFramesRef.current > maxPredictionFrames) {
-        resetTrackingMemory();
+        resetTrackingMemory(false);
       }
       return;
     }
@@ -5476,8 +5728,8 @@ export default function AnalysisEngine({
           modelComplexity: 1,
           smoothLandmarks: true,
           enableSegmentation: false,
-          minDetectionConfidence: 0.5,
-          minTrackingConfidence: 0.55,
+          minDetectionConfidence: 0.2,
+          minTrackingConfidence: 0.25,
         });
 
         poseInstance.onResults(onResults);
@@ -5500,9 +5752,16 @@ export default function AnalysisEngine({
             videoEl.videoHeight > 0;
 
           if (videoReady && !sendingFrame) {
+            const poseFrame = prepareLongRangePoseInput(
+              videoEl,
+              longRangeProcessingRef.current,
+              landmarkMemoryRef.current,
+              missingFramesRef.current
+            );
+            poseInputTransformRef.current = poseFrame.transform;
             sendingFrame = true;
             void poseInstance
-              .send({ image: videoEl })
+              .send({ image: poseFrame.image })
               .catch((error) => {
                 if (!cancelled) {
                   console.error("Pose frame send failed", error);
@@ -5547,6 +5806,8 @@ export default function AnalysisEngine({
       lastStyleTechniqueRef.current = null;
       armIdentityMemoryRef.current = createArmIdentityMemory();
       activeArmMemoryRef.current = createActiveArmMemory();
+      poseInputTransformRef.current = FULL_POSE_INPUT_TRANSFORM;
+      longRangeProcessingRef.current = createLongRangeProcessingState();
       strokeRangeRef.current = { minX: 1, maxX: 0, minY: 1, maxY: 0 };
       lastAnalysisRef.current = null;
       lastStateUpdateRef.current = 0;
