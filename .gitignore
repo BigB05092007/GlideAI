@@ -5,10 +5,17 @@ node_modules/
 # Next.js
 .next/
 out/
+release/
+dist-electron/
 
 # Env / secrets
 .env
 .env*.local
+
+# Local manuals and generated manual agent index
+data/manuals/*
+!data/manuals/.gitkeep
+data/swim-manual-index.json
 
 # Debug / OS
 npm-debug.log*

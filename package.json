@@ -2,14 +2,40 @@
   "name": "glide-ai",
   "version": "1.0.0",
   "private": true,
+  "description": "GlideAI swim biomechanics analyzer",
+  "author": "GlideAI",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "next dev",
+    "build:web": "next build",
+    "build:static": "cross-env STATIC_EXPORT=1 next build",
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx --max-warnings=0",
-    "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix"
+    "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix",
+    "clean:artifacts": "node scripts/clean-local-artifacts.mjs",
+    "calibrate:stroke": "node scripts/calibrate-stroke-model.mjs data/stroke-samples.json src/data/strokeCalibrationModel.json",
+    "agent:ingest": "node scripts/swim-manual-agent.mjs ingest",
+    "agent:ask": "node scripts/swim-manual-agent.mjs ask",
+    "agent:chat": "node scripts/swim-manual-agent.mjs chat",
+    "agent:status": "node scripts/swim-manual-agent.mjs status",
+    "ios:prepare": "npm run build:static && cap sync ios",
+    "ios:add": "cap add ios",
+    "ios:open": "cap open ios",
+    "android:prepare": "npm run build:static && cap sync android",
+    "android:add": "cap add android",
+    "android:open": "cap open android",
+    "android:run": "npm run android:prepare && cap run android",
+    "android:build": "npm run android:prepare && cd android && gradlew assembleDebug",
+    "electron:dev": "concurrently -k \"cross-env BROWSER=none next dev\" \"wait-on http://127.0.0.1:3000 && cross-env ELECTRON_DEV=1 electron .\"",
+    "build:electron": "cross-env ELECTRON_BUILD=1 next build",
+    "electron:pack": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "electron:dir": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:electron && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win dir"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.1",
+    "@capacitor/core": "^8.3.1",
+    "@capacitor/ios": "^8.3.1",
     "@mediapipe/camera_utils": "^0.3.1675466862",
     "@mediapipe/drawing_utils": "^0.3.1675466124",
     "@mediapipe/pose": "0.5.1675469404",
@@ -20,14 +46,54 @@
     "react-webcam": "^7.2.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.3.1",
     "@types/node": "^22.15.2",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
     "autoprefixer": "^10.4.21",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^35.1.5",
+    "electron-builder": "^26.0.12",
     "eslint": "^8.57.1",
     "eslint-config-next": "^15.5.15",
     "postcss": "^8.5.3",
     "tailwindcss": "^3.4.17",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.glideai.desktop",
+    "productName": "GlideAI",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*.cjs",
+      "out/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

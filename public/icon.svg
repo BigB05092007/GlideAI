@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="GlideAI">
+  <rect width="512" height="512" rx="96" fill="#0a0a0f"/>
+  <path d="M92 308c44 0 44-34 88-34s44 34 88 34 44-34 88-34 44 34 88 34" fill="none" stroke="#22d3ee" stroke-width="38" stroke-linecap="round"/>
+  <path d="M92 388c44 0 44-34 88-34s44 34 88 34 44-34 88-34 44 34 88 34" fill="none" stroke="#39ff14" stroke-width="34" stroke-linecap="round" opacity=".9"/>
+  <path d="M256 84l42 98 106 10-80 70 24 104-92-54-92 54 24-104-80-70 106-10z" fill="#e0f2fe"/>
+</svg>

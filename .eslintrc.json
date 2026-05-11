@@ -5,6 +5,9 @@
     ".next/**",
     "out/**",
     "dist/**",
+    "public/vendor/**",
+    "ios/App/App/public/**",
+    "android/app/src/main/assets/public/**",
     "node_modules/**"
   ]
 }

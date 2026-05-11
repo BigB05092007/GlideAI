@@ -1,0 +1,48 @@
+[
+  {
+    "label": "Freestyle",
+    "features": {
+      "syncCue": 0.21,
+      "altDrive": 0.86,
+      "spread": 0.78,
+      "geoSymPair": 0.27,
+      "geoFlyRecovery": 0.18,
+      "geoBreastSweep": 0.12,
+      "kickAlternating": 0.82,
+      "kickSymmetric": 0.23,
+      "kneeFlexSync": 0.34,
+      "bodyRoll": 0.64,
+      "trunkHorizontal": 0.47,
+      "pairedOk": 1,
+      "hasSolidMotion": 1,
+      "bothBelowMid": 0,
+      "bothAboveMid": 0,
+      "backCue": 0,
+      "topView": 0,
+      "topSideView": 0
+    }
+  },
+  {
+    "label": "Breaststroke",
+    "features": {
+      "syncCue": 0.84,
+      "altDrive": 0.19,
+      "spread": 0.31,
+      "geoSymPair": 0.79,
+      "geoFlyRecovery": 0.33,
+      "geoBreastSweep": 0.88,
+      "kickAlternating": 0.22,
+      "kickSymmetric": 0.87,
+      "kneeFlexSync": 0.81,
+      "bodyRoll": 0.25,
+      "trunkHorizontal": 0.18,
+      "pairedOk": 1,
+      "hasSolidMotion": 1,
+      "bothBelowMid": 1,
+      "bothAboveMid": 0,
+      "backCue": 0,
+      "topView": 0,
+      "topSideView": 1
+    }
+  }
+]
